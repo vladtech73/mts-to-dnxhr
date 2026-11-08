@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.part
+*.mts
+*.MTS
+*.m2ts
+*.M2TS
+*.mov
+*.mxf
+dnxhr/
+*_dnxhr/
+converted/
