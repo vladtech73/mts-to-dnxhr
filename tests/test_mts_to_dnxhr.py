@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Optional
@@ -525,6 +526,243 @@ class CliTests(unittest.TestCase):
                 code = m.main([str(root), "--dry-run"])
             self.assertEqual(code, 2)
             self.assertIn("collision", stderr.getvalue())
+
+
+class _FakeFfmpeg:
+    """Popen stand-in. ``poll`` stays ``None`` until terminate or kill."""
+
+    def __init__(self, tmp_dst: Path, script: str) -> None:
+        self.stdout = io.StringIO(script)
+        self.stderr = None
+        self.returncode: Optional[int] = None
+        self._stopped = False
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        tmp_dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dst.write_bytes(b"encoded")
+
+    def poll(self) -> Optional[int]:
+        if self._stopped:
+            return 1
+        return None
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        if self._stopped:
+            self.returncode = 1
+            return 1
+        self.returncode = 0
+        return 0
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self._stopped = True
+        self.returncode = 1
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self._stopped = True
+        self.returncode = 1
+
+
+_PROGRESS_SCRIPT = "out_time_us=500000\nout_time_us=1000000\nprogress=end\n"
+
+
+class HookTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _paths(self) -> tuple[Path, Path]:
+        final = self.root / "out" / "clip.mov"
+        part = final.with_name(final.name + ".part")
+        final.parent.mkdir(parents=True, exist_ok=True)
+        return final, part
+
+    def test_on_progress_renames_part_and_skips_tqdm(self) -> None:
+        final, part = self._paths()
+        calls: list[tuple[float, Optional[float]]] = []
+
+        def on_progress(seconds: float, total: Optional[float]) -> None:
+            calls.append((seconds, total))
+
+        proc = _FakeFfmpeg(part, _PROGRESS_SCRIPT)
+
+        def refuse_tqdm(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("tqdm should not be constructed")
+
+        with mock.patch("mts_to_dnxhr.subprocess.Popen", return_value=proc) as popen:
+            with mock.patch("mts_to_dnxhr.tqdm", side_effect=refuse_tqdm):
+                ok, err = m.run_ffmpeg(
+                    ["ffmpeg", "-i", "in.mts", str(part)],
+                    final,
+                    part,
+                    2.0,
+                    "clip",
+                    on_progress=on_progress,
+                    cancel=None,
+                )
+        self.assertEqual(calls, [(0.5, 2.0), (1.0, 2.0), (2.0, 2.0)])
+        self.assertEqual((ok, err), (True, ""))
+        self.assertFalse(part.exists())
+        self.assertTrue(final.is_file())
+        self.assertGreater(final.stat().st_size, 0)
+        self.assertEqual(popen.call_args.kwargs.get("creationflags"), m._CREATE_NO_WINDOW)
+
+    def test_on_progress_omits_final_callback_when_duration_unknown(self) -> None:
+        final, part = self._paths()
+        calls: list[tuple[float, Optional[float]]] = []
+
+        def on_progress(seconds: float, total: Optional[float]) -> None:
+            calls.append((seconds, total))
+
+        proc = _FakeFfmpeg(part, _PROGRESS_SCRIPT)
+        with mock.patch("mts_to_dnxhr.subprocess.Popen", return_value=proc):
+            with mock.patch("mts_to_dnxhr.tqdm", side_effect=AssertionError("tqdm")):
+                ok, err = m.run_ffmpeg(
+                    ["ffmpeg"],
+                    final,
+                    part,
+                    None,
+                    "clip",
+                    on_progress=on_progress,
+                )
+        self.assertEqual(calls, [(0.5, None), (1.0, None)])
+        self.assertEqual((ok, err), (True, ""))
+        self.assertTrue(final.is_file())
+        self.assertFalse(part.exists())
+
+    def test_cancel_during_progress_stops_ffmpeg_and_removes_part(self) -> None:
+        final, part = self._paths()
+        cancel = threading.Event()
+        calls: list[tuple[float, Optional[float]]] = []
+
+        def on_progress(seconds: float, total: Optional[float]) -> None:
+            calls.append((seconds, total))
+            cancel.set()
+
+        proc = _FakeFfmpeg(part, _PROGRESS_SCRIPT)
+        with mock.patch("mts_to_dnxhr.subprocess.Popen", return_value=proc):
+            with self.assertRaises(m.ConversionCancelled):
+                m.run_ffmpeg(
+                    ["ffmpeg"],
+                    final,
+                    part,
+                    2.0,
+                    "clip",
+                    on_progress=on_progress,
+                    cancel=cancel,
+                )
+        self.assertEqual(calls, [(0.5, 2.0)])
+        self.assertGreaterEqual(proc.terminate_calls, 1)
+        self.assertFalse(part.exists())
+        self.assertFalse(final.exists())
+
+    def test_convert_one_already_cancelled_does_not_create_dir(self) -> None:
+        src = self.root / "clip.MTS"
+        src.write_bytes(b"")
+        dst = self.root / "out" / "clip.mov"
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(m.ConversionCancelled):
+            m.convert_one(src, dst, _opts(), "ffmpeg", "ffprobe", cancel=cancel)
+        self.assertFalse(dst.parent.exists())
+
+    def test_convert_one_cancel_during_encode_removes_empty_dir(self) -> None:
+        src = self.root / "clip.MTS"
+        src.write_bytes(b"")
+        dst = self.root / "out" / "clip.mov"
+        part = dst.with_name(dst.name + ".part")
+        cancel = threading.Event()
+        info = m.ProbeInfo(
+            duration=2.0,
+            field_order="tt",
+            avg_frame_rate="30000/1001",
+            has_audio=True,
+        )
+
+        def on_progress(seconds: float, total: Optional[float]) -> None:
+            cancel.set()
+
+        proc = _FakeFfmpeg(part, _PROGRESS_SCRIPT)
+        with mock.patch("mts_to_dnxhr.probe", return_value=info):
+            with mock.patch("mts_to_dnxhr.subprocess.Popen", return_value=proc):
+                with self.assertRaises(m.ConversionCancelled):
+                    m.convert_one(
+                        src,
+                        dst,
+                        _opts(),
+                        "ffmpeg",
+                        "ffprobe",
+                        on_progress=on_progress,
+                        cancel=cancel,
+                    )
+        self.assertFalse(dst.parent.exists())
+        self.assertFalse(part.exists())
+        self.assertGreaterEqual(proc.terminate_calls, 1)
+
+    def test_log_callback_replaces_tqdm_write(self) -> None:
+        src = self.root / "clip.MTS"
+        src.write_bytes(b"")
+        dst = self.root / "out" / "clip.mov"
+        info = m.ProbeInfo(
+            duration=1.0,
+            field_order="progressive",
+            avg_frame_rate="30/1",
+            has_audio=False,
+        )
+        messages: list[str] = []
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("mts_to_dnxhr.probe", return_value=info):
+            with mock.patch("mts_to_dnxhr.run_ffmpeg", return_value=(True, "")):
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    status, err = m.convert_one(
+                        src,
+                        dst,
+                        _opts(),
+                        "ffmpeg",
+                        "ffprobe",
+                        log=messages.append,
+                    )
+        self.assertEqual((status, err), ("ok", ""))
+        self.assertEqual(messages, [f"wrote {dst}"])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+        dst.write_bytes(b"keep")
+        skipped: list[str] = []
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            status, err = m.convert_one(
+                src,
+                dst,
+                _opts(),
+                "ffmpeg",
+                "ffprobe",
+                log=skipped.append,
+            )
+        self.assertEqual((status, err), ("skipped", ""))
+        self.assertEqual(skipped, [f"skipped (exists): {dst}"])
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    @unittest.skipUnless(sys.platform == "win32", "CREATE_NO_WINDOW is Windows-only")
+    def test_child_processes_hide_console_on_windows(self) -> None:
+        completed = mock.Mock(returncode=0, stdout='{"streams":[]}', stderr="")
+        with mock.patch("mts_to_dnxhr.subprocess.run", return_value=completed) as run:
+            m.probe(self.root / "clip.MTS", "ffprobe")
+        self.assertEqual(run.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+        self.assertIs(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+        final, part = self._paths()
+        proc = _FakeFfmpeg(part, _PROGRESS_SCRIPT)
+        with mock.patch("mts_to_dnxhr.subprocess.Popen", return_value=proc) as popen:
+            m.run_ffmpeg(["ffmpeg"], final, part, 1.0, "clip", on_progress=lambda *_a: None)
+        self.assertEqual(popen.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
 
 
 def _first_sample() -> Optional[Path]:

@@ -21,7 +21,7 @@ Install FFmpeg:
 - macOS: `brew install ffmpeg`
 - Debian/Ubuntu: `apt install ffmpeg`
 
-`tqdm` is the only Python dependency. From the repo root:
+`tqdm` is the CLI dependency. The desktop window also uses `tkinterdnd2` for drag-and-drop. From the repo root:
 
 ```powershell
 python -m venv .venv
@@ -45,7 +45,7 @@ Rates below are video bitrate at 1920×1080, `30000/1001`, measured with FFmpeg 
 | `dnxhr_lb` | 8-bit | 4:2:2 (`yuv422p`) | ~45 Mb/s | ~0.35 GB | Proxies. |
 | `dnxhr_444` | 10-bit | 4:4:4 (`yuv444p10le`) | ~440 Mb/s | ~3.3 GB | Rarely useful for 4:2:0 AVCHD. The encoder upsamples; it does not recover chroma. |
 
-A full HQX or HQ encode of a 168-second 1080i clip is about 4.7 GB (about 14× a 335 MB source). LB is about 1.0 GB, SQ about 3.1 GB, and 444 about 9.3 GB for that same duration. There is no free-space check before encoding.
+A full HQX or HQ encode of a 168-second 1080i clip is about 4.7 GB (about 14× a 335 MB source). LB is about 1.0 GB, SQ about 3.1 GB, and 444 about 9.3 GB for that same duration. The CLI does not check free space before encoding. The desktop app warns when the estimate (about 14× the source size of files that are not already in the export folder) is larger than the free space on that drive.
 
 ### Verified on FFmpeg 8.0.1
 
@@ -100,6 +100,31 @@ Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite
 
 Exit codes: `0` every file converted or skipped, `1` at least one file failed (the batch continues), `2` usage or preflight error (bad path, no clips, FFmpeg missing, two inputs mapping to one output), `130` interrupted. Ctrl+C stops ffmpeg and deletes the partial file.
 
+## Desktop app (Windows)
+
+The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+
+Run it from source, from the repo root:
+
+```powershell
+.\.venv\Scripts\pythonw.exe mts_to_dnxhr_gui.py
+```
+
+`pythonw mts_to_dnxhr_gui.py` does the same thing when that interpreter already has the requirements installed. Use `python.exe` instead of `pythonw.exe` if you want a console for debugging.
+
+Build a double-clickable exe:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+powershell -ExecutionPolicy Bypass -File scripts\build_exe.ps1
+```
+
+That writes `dist\MTS-to-DNxHR.exe`.
+
+The exe is self-contained. Copy it anywhere, such as `C:\Tools\MTS-to-DNxHR\`. Then right-click it and choose **Pin to Start** or **Pin to taskbar**, or **Show more options → Send to → Desktop (create shortcut)**. FFmpeg must be on `PATH`, or `ffmpeg.exe` and `ffprobe.exe` must sit in the folder where the **exe** lives, not where the shortcut is. An unsigned exe can show a SmartScreen prompt; choose **More info → Run anyway**.
+
+To change the icon, replace `assets\app.ico` with another multi-size `.ico`, or edit and re-run `scripts\make_icon.py`, then rebuild. If Explorer still shows the old icon, run `ie4uinit.exe -show` or sign out and back in.
+
 ## Output layout
 
 - A file input writes to `<file parent>/dnxhr/` when `--output` is omitted. `clip.MTS` becomes `dnxhr/clip.mov`.
@@ -145,7 +170,7 @@ See `samples/README.md`. Media in that folder is gitignored and must not be comm
 
 ## Limitations
 
-- No installer, `pyproject.toml`, or bundled FFmpeg. No GUI.
+- There is a minimal Windows GUI (DNxHR HQX, MOV, and 16-bit PCM only; use the CLI for other profiles). No installer, code signing, `pyproject.toml`, or bundled FFmpeg.
 - Encodes run one at a time, in software. There is no GPU encoder and no parallel batch.
 - Spanned AVCHD recordings stay as separate files. Each clip converts on its own, so there is a cut at each file boundary. Frames are not dropped. Joining them, reading `.MPL` playlists, and preserving camera timecode are out of scope.
 - No 59.94p (field-rate) deinterlace, scaling, frame-rate conversion, color tagging, or LUTs.

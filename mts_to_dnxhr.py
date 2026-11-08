@@ -15,9 +15,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, TextIO
+from typing import Callable, Optional, TextIO
 
 from tqdm import tqdm
 
@@ -41,9 +42,18 @@ INSTALL_HINT = (
     "  apt install ffmpeg"
 )
 
+# Hide the console window that a windowed GUI would otherwise flash for each child.
+_CREATE_NO_WINDOW = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+)
+
 
 class ProbeError(Exception):
     """ffprobe failed or returned data that could not be parsed."""
+
+
+class ConversionCancelled(Exception):
+    """The caller asked to stop; ffmpeg was stopped and the .part removed."""
 
 
 @dataclass(frozen=True)
@@ -232,6 +242,8 @@ def probe(src: Path, ffprobe: str) -> ProbeInfo:
             errors="replace",
             timeout=60,
             check=False,
+            creationflags=_CREATE_NO_WINDOW,
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:
         raise ProbeError(f"ffprobe timed out: {src}") from exc
@@ -432,11 +444,17 @@ def run_ffmpeg(
     tmp_dst: Path,
     duration: Optional[float],
     desc: str,
+    *,
+    on_progress: Optional[Callable[[float, Optional[float]], None]] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> tuple[bool, str]:
-    """Run ffmpeg, update an inner progress bar, and publish ``tmp_dst`` on success.
+    """Run ffmpeg and publish ``tmp_dst`` on success.
 
-    stderr goes to a temp file so it cannot fill a pipe and deadlock the read
-    of ``-progress``. The ``.part`` file is removed on failure and on any error.
+    With no ``on_progress`` callback, an inner tqdm bar tracks ``-progress``.
+    When the callback is set, it receives ``(seconds, total)`` and no bar is
+    created. ``cancel`` is checked only on that callback path. stderr goes to
+    a temp file so it cannot fill a pipe and deadlock the progress read. The
+    ``.part`` file is removed on failure and on any error.
     """
     stderr_handle: Optional[TextIO] = None
     stderr_path: Optional[str] = None
@@ -456,23 +474,38 @@ def run_ffmpeg(
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=_CREATE_NO_WINDOW,
         )
         total = duration if duration is not None and duration > 0 else None
-        with tqdm(total=total, unit="s", leave=False, desc=desc) as bar:
-            assert proc.stdout is not None
+        assert proc.stdout is not None
+        if on_progress is None:
+            with tqdm(total=total, unit="s", leave=False, desc=desc) as bar:
+                for line in proc.stdout:
+                    seconds = parse_progress_line(line)
+                    if seconds is None:
+                        continue
+                    if bar.total is not None:
+                        bar.n = min(seconds, float(bar.total))
+                    else:
+                        bar.n = seconds
+                    bar.refresh()
+                returncode = proc.wait()
+                if returncode == 0 and bar.total is not None:
+                    bar.n = float(bar.total)
+                    bar.refresh()
+        else:
             for line in proc.stdout:
+                if cancel is not None and cancel.is_set():
+                    raise ConversionCancelled()
                 seconds = parse_progress_line(line)
                 if seconds is None:
                     continue
-                if bar.total is not None:
-                    bar.n = min(seconds, float(bar.total))
-                else:
-                    bar.n = seconds
-                bar.refresh()
+                on_progress(seconds, total)
+            if cancel is not None and cancel.is_set():
+                raise ConversionCancelled()
             returncode = proc.wait()
-            if returncode == 0 and bar.total is not None:
-                bar.n = float(bar.total)
-                bar.refresh()
+            if returncode == 0 and total is not None:
+                on_progress(total, total)
         if (
             returncode == 0
             and tmp_dst.is_file()
@@ -520,50 +553,72 @@ def convert_one(
     opts: Options,
     ffmpeg: str,
     ffprobe: str,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+    on_progress: Optional[Callable[[float, Optional[float]], None]] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> tuple[str, str]:
-    """Convert one clip. Returns ``(status, error)`` with status ok, skipped, or failed."""
+    """Convert one clip. Returns ``(status, error)`` with status ok, skipped, or failed.
+
+    ``log`` replaces ``tqdm.write`` when the caller has no console. ``cancel``
+    raises ``ConversionCancelled`` instead of reporting a failure.
+    """
+    emit = log or tqdm.write
     if final_dst.exists() and not opts.overwrite:
-        tqdm.write(f"skipped (exists): {final_dst}")
+        emit(f"skipped (exists): {final_dst}")
         return "skipped", ""
+    if cancel is not None and cancel.is_set():
+        raise ConversionCancelled()
     try:
         final_dst.parent.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         message = str(exc)
-        tqdm.write(f"failed: {src}: {message}")
+        emit(f"failed: {src}: {message}")
         return "failed", message
     try:
         info = probe(src, ffprobe)
     except ProbeError as exc:
         message = _without_path_prefix(src, str(exc))
         _remove_dir_if_empty(final_dst.parent)
-        tqdm.write(f"failed: {src}: {message}")
+        emit(f"failed: {src}: {message}")
         return "failed", message
     except OSError as exc:
         message = str(exc)
         _remove_dir_if_empty(final_dst.parent)
-        tqdm.write(f"failed: {src}: {message}")
+        emit(f"failed: {src}: {message}")
         return "failed", message
     if opts.deinterlace and not info.interlaced:
-        tqdm.write(f"note: {src.name} is progressive; skipping deinterlace")
+        emit(f"note: {src.name} is progressive; skipping deinterlace")
     tmp_dst = final_dst.with_name(final_dst.name + ".part")
     cmd = build_command(ffmpeg, src, tmp_dst, opts, info, force=True)
     try:
-        ok, err = run_ffmpeg(cmd, final_dst, tmp_dst, _bar_total(info, opts), src.name)
+        ok, err = run_ffmpeg(
+            cmd,
+            final_dst,
+            tmp_dst,
+            _bar_total(info, opts),
+            src.name,
+            on_progress=on_progress,
+            cancel=cancel,
+        )
     except KeyboardInterrupt:
+        raise
+    except ConversionCancelled:
+        _remove_dir_if_empty(final_dst.parent)
         raise
     except OSError as exc:
         _remove_dir_if_empty(final_dst.parent)
-        tqdm.write(f"failed: {src}: {exc}")
+        emit(f"failed: {src}: {exc}")
         return "failed", str(exc)
     except Exception as exc:
         _remove_dir_if_empty(final_dst.parent)
-        tqdm.write(f"failed: {src}: {exc}")
+        emit(f"failed: {src}: {exc}")
         return "failed", str(exc)
     if ok:
-        tqdm.write(f"wrote {final_dst}")
+        emit(f"wrote {final_dst}")
         return "ok", ""
     _remove_dir_if_empty(final_dst.parent)
-    tqdm.write(f"failed: {src}: {err}")
+    emit(f"failed: {src}: {err}")
     return "failed", err
 
 

@@ -11,3 +11,5 @@ __pycache__/
 dnxhr/
 *_dnxhr/
 converted/
+build/
+dist/
