@@ -542,6 +542,7 @@ class CliTests(unittest.TestCase):
             "--overwrite",
             "--dry-run",
             "--duration",
+            "--jobs",
         ):
             self.assertIn(flag, help_text)
         self.assertIn("testing aid", help_text)
@@ -552,6 +553,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(args.deinterlace)
         self.assertFalse(args.overwrite)
         self.assertFalse(args.dry_run)
+        self.assertEqual(args.jobs, 1)
 
     def test_dry_run_without_ffmpeg_prints_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -572,6 +574,20 @@ class CliTests(unittest.TestCase):
             self.assertIn("pcm_s16le", text)
             self.assertFalse((root / "dnxhr").exists())
 
+    def test_header_prints_jobs_and_above_suggestion_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp).resolve() / "clip.MTS"
+            clip.write_bytes(b"")
+            for jobs, suggested, expect_note in ((1, 1, False), (2, 1, True), (2, 2, False)):
+                stdout = io.StringIO()
+                with mock.patch("mts_to_dnxhr.find_tool", return_value=None), mock.patch(
+                    "mts_to_dnxhr.suggested_jobs", return_value=suggested
+                ), contextlib.redirect_stdout(stdout):
+                    code = m.main([str(clip), "--dry-run", "--jobs", str(jobs)])
+                text = stdout.getvalue()
+                self.assertEqual(code, 0)
+                self.assertIn(f"jobs: {jobs}", text)
+                self.assertEqual("note: --jobs" in text, expect_note)
 
     def test_dry_run_overwrite_flag_matches_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -718,6 +734,88 @@ class CliTests(unittest.TestCase):
                 code = m.main([str(root), "--dry-run"])
             self.assertEqual(code, 2)
             self.assertIn("collision", stderr.getvalue())
+
+    def test_jobs_outside_range_exit_2(self) -> None:
+        parser = m.build_parser()
+        for bad in ("0", "5", "x"):
+            with self.assertRaises(SystemExit) as caught:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parser.parse_args(["clip.MTS", "--jobs", bad])
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_encode_all_jobs_two_ok_failed_and_cancelled(self) -> None:
+        pairs = [(Path("a.MTS"), Path("a.mov")), (Path("b.MTS"), Path("b.mov"))]
+        opts = _opts()
+
+        def check_parallel(*_args: object, **kwargs: object) -> None:
+            self.assertIsNotNone(kwargs.get("on_progress"))
+            self.assertIsNotNone(kwargs.get("cancel"))
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def ok_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            barrier.wait()
+            return "ok", ""
+
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=ok_convert):
+            code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        self.assertEqual(code, 0)
+
+        fail_barrier = threading.Barrier(2, timeout=5)
+
+        def fail_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            fail_barrier.wait()
+            src = args[0]
+            assert isinstance(src, Path)
+            if src.name == "b.MTS":
+                return "failed", "nope"
+            return "ok", ""
+
+        stdout = io.StringIO()
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=fail_convert):
+            with contextlib.redirect_stdout(stdout):
+                code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        text = stdout.getvalue()
+        self.assertEqual(code, 1)
+        summary_at = text.find("converted 1, skipped 0, failed 1")
+        failed_at = text.find("failed: b.MTS")
+        self.assertGreater(summary_at, -1)
+        self.assertGreater(failed_at, summary_at)
+        self.assertIn("nope", text[failed_at:])
+
+        def cancel_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            src = args[0]
+            assert isinstance(src, Path)
+            if src.name == "b.MTS":
+                raise m.ConversionCancelled()
+            return "ok", ""
+
+        stdout = io.StringIO()
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=cancel_convert):
+            with contextlib.redirect_stdout(stdout):
+                code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        self.assertEqual(code, 0)
+        self.assertIn("converted 1, skipped 0, failed 0", stdout.getvalue())
+        self.assertNotIn("failed: b.MTS", stdout.getvalue())
+
+    def test_jobs_one_omits_on_progress(self) -> None:
+        def fake_convert(*_args: object, **kwargs: object) -> tuple[str, str]:
+            self.assertIsNone(kwargs.get("on_progress"))
+            return "ok", ""
+
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=fake_convert) as convert:
+            code = m._encode_all(
+                [(Path("a.MTS"), Path("a.mov"))],
+                _opts(),
+                "ffmpeg",
+                "ffprobe",
+                jobs=1,
+            )
+        self.assertEqual(code, 0)
+        self.assertIsNone(convert.call_args.kwargs.get("on_progress"))
 
 
 class _FakeFfmpeg:
