@@ -36,6 +36,15 @@ def _progressive() -> core.ProbeInfo:
     )
 
 
+class FormatElapsedTests(unittest.TestCase):
+    def test_minutes_and_hours(self) -> None:
+        self.assertEqual(gui.format_elapsed(0), "0:00")
+        self.assertEqual(gui.format_elapsed(5.9), "0:05")
+        self.assertEqual(gui.format_elapsed(83), "1:23")
+        self.assertEqual(gui.format_elapsed(3723), "1:02:03")
+        self.assertEqual(gui.format_elapsed(-1), "0:00")
+
+
 class DefaultsTests(unittest.TestCase):
     def test_defaults_match_cli_encode_argv(self) -> None:
         args = core.build_parser().parse_args(["clip.mts"])

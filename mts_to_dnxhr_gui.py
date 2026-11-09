@@ -48,6 +48,18 @@ _DROP_HOT = "#d6e8ff"
 _DROP_PAUSED_BG = "#d0d0d0"
 _DROP_PAUSED = "Converting… drops are paused"
 _IDLE_STATUS = "Add clips, choose an export folder, then click Convert."
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format a duration for the status line (``M:SS`` or ``H:MM:SS``)."""
+    if seconds < 0:
+        seconds = 0.0
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "{0}:{1:02d}:{2:02d}".format(hours, minutes, secs)
+    return "{0}:{1:02d}".format(minutes, secs)
 _FFMPEG_MISSING = (
     "FFmpeg was not found. Install it with `winget install Gyan.FFmpeg` "
     "(then sign out and back in), or put ffmpeg.exe and ffprobe.exe next to this program."
@@ -322,6 +334,10 @@ class App:
         self._current_fraction = 0.0
         self._known_total = True
         self._quit_deadline = 0.0
+        self._batch_t0: Optional[float] = None
+        self._file_t0: Optional[float] = None
+        self._active_index: Optional[int] = None
+        self._status_pct: Optional[int] = 0  # None = unknown duration
 
         self._build()
         self._apply_tools_banner()
@@ -759,6 +775,10 @@ class App:
         self._finished_files = 0
         self._current_fraction = 0.0
         self._known_total = True
+        self._batch_t0 = time.monotonic()
+        self._file_t0 = None
+        self._active_index = None
+        self._status_pct = 0
         self.progress["value"] = 0
         self.cancel = threading.Event()
         self.running = True
@@ -799,12 +819,59 @@ class App:
             return
         self.cancel.set()
         self.convert_btn.configure(state="disabled")
-        self.status_var.set("Stopping…")
+        self.status_var.set(self._with_times("Stopping…"))
 
     def _poll(self) -> None:
         self._drain_events()
         if self.running:
+            self._refresh_running_status()
             self.root.after(100, self._poll)
+
+    def _elapsed_batch(self) -> Optional[float]:
+        if self._batch_t0 is None:
+            return None
+        return time.monotonic() - self._batch_t0
+
+    def _elapsed_file(self) -> Optional[float]:
+        if self._file_t0 is None:
+            return None
+        return time.monotonic() - self._file_t0
+
+    def _with_times(self, prefix: str, *, include_file: bool = True) -> str:
+        """Append `` · file M:SS · total M:SS`` when timers are running."""
+        parts = [prefix]
+        file_secs = self._elapsed_file() if include_file else None
+        batch_secs = self._elapsed_batch()
+        if file_secs is not None:
+            parts.append("file {0}".format(format_elapsed(file_secs)))
+        if batch_secs is not None:
+            parts.append("total {0}".format(format_elapsed(batch_secs)))
+        if len(parts) == 1:
+            return prefix
+        return " · ".join(parts)
+
+    def _running_prefix(self) -> str:
+        count = len(self.items)
+        index = self._active_index
+        if index is None or index < 0 or index >= count:
+            return "Converting…"
+        name = self.items[index].src.name
+        if self._status_pct is None:
+            return "Converting {0} of {1}: {2}…".format(index + 1, count, name)
+        return "Converting {0} of {1}: {2} ({3}%)".format(
+            index + 1, count, name, self._status_pct
+        )
+
+    def _refresh_running_status(self) -> None:
+        if not self.running or self._quitting:
+            return
+        text = self.status_var.get()
+        if text.startswith("Stopping"):
+            self.status_var.set(self._with_times("Stopping…", include_file=False))
+            return
+        if self._active_index is None:
+            return
+        self.status_var.set(self._with_times(self._running_prefix()))
 
     def _drain_events(self) -> None:
         try:
@@ -825,28 +892,25 @@ class App:
             self.running = False
             return
         kind = event[0]
-        count = len(self.items)
         if kind == "file_started":
             index = event[1]
             self._current_fraction = 0.0
             self._known_total = True
+            self._file_t0 = time.monotonic()
+            self._active_index = index
+            self._status_pct = 0
             self._set_status_cell(index, "0%")
-            name = self.items[index].src.name
-            self.status_var.set(
-                "Converting {0} of {1}: {2} (0%)".format(index + 1, count, name)
-            )
+            self.status_var.set(self._with_times(self._running_prefix()))
             self._update_overall()
         elif kind == "file_progress":
             index = event[1]
             fraction = event[2]
-            name = self.items[index].src.name
+            self._active_index = index
             if fraction is None:
                 self._known_total = False
                 self._current_fraction = 0.0
+                self._status_pct = None
                 self._set_status_cell(index, "Converting…")
-                self.status_var.set(
-                    "Converting {0} of {1}: {2}…".format(index + 1, count, name)
-                )
             else:
                 self._known_total = True
                 self._current_fraction = fraction
@@ -855,10 +919,9 @@ class App:
                     pct = 0
                 elif pct > 100:
                     pct = 100
+                self._status_pct = pct
                 self._set_status_cell(index, "{0}%".format(pct))
-                self.status_var.set(
-                    "Converting {0} of {1}: {2} ({3}%)".format(index + 1, count, name, pct)
-                )
+            self.status_var.set(self._with_times(self._running_prefix()))
             self._update_overall()
         elif kind == "file_finished":
             index = event[1]
@@ -870,27 +933,47 @@ class App:
                 "failed": "Failed (double-click for details)",
                 "cancelled": "Cancelled",
             }.get(status, "Failed (double-click for details)")
+            file_secs = self._elapsed_file()
+            # Only stamp a duration when this row was the active encode.
+            if (
+                file_secs is not None
+                and self._active_index == index
+                and status in ("ok", "failed", "cancelled", "skipped")
+            ):
+                text = "{0} ({1})".format(text, format_elapsed(file_secs))
             self._set_status_cell(index, text)
             if index < len(self.errors):
                 self.errors[index] = err if status == "failed" else ""
             self._finished_files += 1
             self._current_fraction = 0.0
             self._known_total = True
+            self._file_t0 = None
+            self._active_index = None
+            self._status_pct = 0
             self._update_overall()
         elif kind == "batch_finished":
             _ok, _skipped, failed, cancelled = event[1], event[2], event[3], event[4]
             summary = self._summary_line(event[1], event[2], failed, cancelled)
             self.running = False
+            self._file_t0 = None
+            self._active_index = None
             self._set_running_ui(False)
             self.status_var.set(summary)
             self._show_finished(summary, failed)
 
     def _summary_line(self, ok: int, skipped: int, failed: int, cancelled: int) -> str:
         if cancelled:
-            return (
+            line = (
                 "Stopped: {0} converted, {1} skipped, {2} failed, {3} not converted."
             ).format(ok, skipped, failed, cancelled)
-        return "Finished: {0} converted, {1} skipped, {2} failed.".format(ok, skipped, failed)
+        else:
+            line = "Finished: {0} converted, {1} skipped, {2} failed.".format(
+                ok, skipped, failed
+            )
+        batch_secs = self._elapsed_batch()
+        if batch_secs is not None:
+            line = "{0} · Total {1}".format(line, format_elapsed(batch_secs))
+        return line
 
     def _update_overall(self) -> None:
         count = len(self.items)
