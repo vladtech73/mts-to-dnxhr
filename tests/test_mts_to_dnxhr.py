@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Optional
@@ -387,6 +388,146 @@ class CommandTests(unittest.TestCase):
         self.assertIn('"0:a?"', text)
 
 
+class JobsTests(unittest.TestCase):
+    def test_suggested_jobs_table(self) -> None:
+        expected = {
+            0: 1,
+            4: 1,
+            8: 1,
+            11: 1,
+            12: 2,
+            16: 2,
+            18: 2,
+            20: 2,
+            128: 2,
+        }
+        for cpu_count, jobs in expected.items():
+            self.assertEqual(m.suggested_jobs(cpu_count), jobs)
+            self.assertLessEqual(jobs, m.MAX_JOBS)
+
+    def test_suggested_jobs_reads_cpu_count_when_omitted(self) -> None:
+        with mock.patch("mts_to_dnxhr.os.cpu_count", return_value=None):
+            self.assertEqual(m.suggested_jobs(), 1)
+            self.assertEqual(m.suggested_jobs(None), 1)
+        with mock.patch("mts_to_dnxhr.os.cpu_count", return_value=20):
+            self.assertEqual(m.suggested_jobs(), 2)
+            self.assertEqual(m.suggested_jobs(None), 2)
+
+    def test_run_indexed_bounds_in_flight_and_covers_every_index(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        in_flight = 0
+        max_in_flight = 0
+        seen: list[int] = []
+
+        def work(index: int) -> None:
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                if in_flight > max_in_flight:
+                    max_in_flight = in_flight
+                seen.append(index)
+            time.sleep(0.02)
+            with lock:
+                in_flight -= 1
+
+        m.run_indexed(8, 3, work, cancel)
+        self.assertEqual(max_in_flight, 3)
+        self.assertEqual(sorted(seen), list(range(8)))
+
+    def test_run_indexed_overlaps(self) -> None:
+        barrier = threading.Barrier(2, timeout=5)
+        cancel = threading.Event()
+
+        def work(_index: int) -> None:
+            barrier.wait()
+
+        m.run_indexed(2, 2, work, cancel)
+
+    def test_jobs_above_cap_are_clamped(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        in_flight = 0
+        max_in_flight = 0
+
+        def work(_index: int) -> None:
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                if in_flight > max_in_flight:
+                    max_in_flight = in_flight
+            time.sleep(0.02)
+            with lock:
+                in_flight -= 1
+
+        m.run_indexed(8, 99, work, cancel)
+        self.assertLessEqual(max_in_flight, m.MAX_JOBS)
+
+    def test_jobs_one_runs_inline_in_order(self) -> None:
+        caller = threading.current_thread()
+        order: list[int] = []
+        cancel = threading.Event()
+
+        def work(index: int) -> None:
+            self.assertIs(threading.current_thread(), caller)
+            order.append(index)
+
+        self.assertEqual(m.run_indexed(0, 2, work, cancel), [])
+        m.run_indexed(4, 1, work, cancel)
+        self.assertEqual(order, [0, 1, 2, 3])
+
+    def test_cancel_during_work_jobs_one_returns_the_rest(self) -> None:
+        cancel = threading.Event()
+        ran: list[int] = []
+
+        def work(index: int) -> None:
+            ran.append(index)
+            if index == 1:
+                cancel.set()
+
+        unstarted = m.run_indexed(5, 1, work, cancel)
+        self.assertEqual(ran, [0, 1])
+        self.assertEqual(unstarted, [2, 3, 4])
+
+    def test_cancel_during_work_jobs_two_partitions_indices(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        ran: list[int] = []
+
+        def work(index: int) -> None:
+            with lock:
+                ran.append(index)
+            if index == 1:
+                cancel.set()
+
+        count = 6
+        unstarted = m.run_indexed(count, 2, work, cancel)
+        self.assertEqual(sorted(ran + unstarted), list(range(count)))
+        self.assertEqual(len(set(ran) & set(unstarted)), 0)
+
+    def test_cancel_already_set_runs_nothing(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        calls: list[int] = []
+
+        def work(index: int) -> None:
+            calls.append(index)
+
+        self.assertEqual(m.run_indexed(4, 2, work, cancel), [0, 1, 2, 3])
+        self.assertEqual(calls, [])
+
+    def test_exception_is_reraised_and_sets_cancel(self) -> None:
+        cancel = threading.Event()
+
+        def work(index: int) -> None:
+            if index == 0:
+                raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            m.run_indexed(3, 2, work, cancel)
+        self.assertTrue(cancel.is_set())
+
+
 class CliTests(unittest.TestCase):
     def test_help_lists_flags_and_defaults(self) -> None:
         parser = m.build_parser()
@@ -430,6 +571,7 @@ class CliTests(unittest.TestCase):
             self.assertIn("yuv422p10le", text)
             self.assertIn("pcm_s16le", text)
             self.assertFalse((root / "dnxhr").exists())
+
 
     def test_dry_run_overwrite_flag_matches_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -515,6 +657,56 @@ class CliTests(unittest.TestCase):
             self.assertEqual(status, "failed")
             self.assertEqual(err, "Invalid data found when processing input")
             self.assertFalse(dst.parent.exists())
+
+    def test_shared_parent_survives_sibling_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            src_a = root / "a.MTS"
+            src_b = root / "b.MTS"
+            src_a.write_bytes(b"")
+            src_b.write_bytes(b"")
+            dst_a = root / "out" / "a.mov"
+            dst_b = root / "out" / "b.mov"
+            b_in_probe = threading.Event()
+            release_b = threading.Event()
+
+            def fake_probe(src: Path, _ffprobe: str) -> m.ProbeInfo:
+                if src.name == "b.MTS":
+                    b_in_probe.set()
+                    if not release_b.wait(timeout=5):
+                        raise m.ProbeError("timed out waiting to release b")
+                    raise m.ProbeError("b failed")
+                if not b_in_probe.wait(timeout=5):
+                    raise m.ProbeError("timed out waiting for b")
+                raise m.ProbeError("a failed")
+
+            results: dict[str, tuple[str, str]] = {}
+
+            def run(name: str, src: Path, dst: Path) -> None:
+                results[name] = m.convert_one(
+                    src,
+                    dst,
+                    _opts(),
+                    "ffmpeg",
+                    "ffprobe",
+                    log=lambda _line: None,
+                )
+
+            with mock.patch("mts_to_dnxhr.probe", side_effect=fake_probe):
+                thread_a = threading.Thread(target=run, args=("a", src_a, dst_a))
+                thread_b = threading.Thread(target=run, args=("b", src_b, dst_b))
+                thread_a.start()
+                thread_b.start()
+                thread_a.join(timeout=5)
+                self.assertFalse(thread_a.is_alive())
+                self.assertEqual(results["a"][0], "failed")
+                self.assertTrue(dst_a.parent.exists())
+                release_b.set()
+                thread_b.join(timeout=5)
+                self.assertFalse(thread_b.is_alive())
+                self.assertEqual(results["b"][0], "failed")
+                self.assertFalse(dst_b.parent.exists())
+                self.assertEqual(m._dir_users, {})
 
     def test_collision_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

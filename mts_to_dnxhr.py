@@ -34,6 +34,7 @@ AUDIO_CODECS = {16: "pcm_s16le", 24: "pcm_s24le"}
 CONTAINERS = {"mov": "mov", "mxf": "mxf"}
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 YADIF = "yadif=mode=send_frame:parity=auto:deint=interlaced"
+MAX_JOBS = 4
 INSTALL_HINT = (
     "error: ffmpeg and ffprobe must be on PATH.\n"
     "Install FFmpeg, then run this command again:\n"
@@ -46,6 +47,13 @@ INSTALL_HINT = (
 _CREATE_NO_WINDOW = (
     getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
 )
+
+
+def suggested_jobs(cpu_count: Optional[int] = None) -> int:
+    """Advisory parallel encodes: about 6 logical CPUs per extra stream (CPU headroom
+    for ~28 MB/s HQX streams), capped at 2."""
+    n = os.cpu_count() if cpu_count is None else cpu_count
+    return max(1, min(2, (n or 0) // 6))
 
 
 class ProbeError(Exception):
@@ -381,6 +389,36 @@ def _remove_dir_if_empty(directory: Path) -> None:
         pass
 
 
+# One lock for every output folder so mkdir(parents=True) cannot interleave with rmdir.
+_DIR_LOCK = threading.Lock()
+_dir_users: dict[str, int] = {}
+
+
+def _dir_key(directory: Path) -> str:
+    return os.path.normcase(os.path.abspath(directory))
+
+
+def _claim_dir(directory: Path) -> None:
+    """Create ``directory`` and count one user. A failed ``mkdir`` does not count."""
+    key = _dir_key(directory)
+    with _DIR_LOCK:
+        directory.mkdir(parents=True, exist_ok=True)
+        _dir_users[key] = _dir_users.get(key, 0) + 1
+
+
+def _release_dir(directory: Path, remove_if_empty: bool) -> None:
+    """Drop one user. Remove the folder only when the last user asks for it."""
+    key = _dir_key(directory)
+    with _DIR_LOCK:
+        count = _dir_users.get(key, 0) - 1
+        if count <= 0:
+            _dir_users.pop(key, None)
+            if remove_if_empty:
+                _remove_dir_if_empty(directory)
+        else:
+            _dir_users[key] = count
+
+
 def _without_path_prefix(src: Path, detail: str) -> str:
     """Drop a leading ``path:`` that ffprobe already includes in stderr."""
     text = detail.strip()
@@ -547,6 +585,68 @@ def run_ffmpeg(
             _unlink_quiet(Path(stderr_path))
 
 
+def run_indexed(
+    count: int,
+    jobs: int,
+    work: Callable[[int], None],
+    cancel: threading.Event,
+) -> list[int]:
+    """Run ``work(i)`` for ``i`` in ``0..count-1`` on up to ``jobs`` threads.
+
+    Indices still queued when ``cancel`` is set are not started. Returns those
+    indices, sorted. ``jobs == 1`` runs inline on the caller thread.
+    """
+    if count <= 0:
+        return []
+    workers = max(1, min(jobs, MAX_JOBS, count))
+    lock = threading.Lock()
+    next_index = 0
+    unstarted: list[int] = []
+    first_error: list[BaseException] = []
+
+    def loop() -> None:
+        nonlocal next_index
+        while True:
+            with lock:
+                if next_index >= count:
+                    return
+                index = next_index
+                next_index += 1
+                if cancel.is_set():
+                    unstarted.append(index)
+                    continue
+            try:
+                work(index)
+            except BaseException as exc:
+                with lock:
+                    if not first_error:
+                        first_error.append(exc)
+                cancel.set()
+                return
+
+    if workers == 1:
+        loop()
+    else:
+        threads = [
+            threading.Thread(target=loop, daemon=True) for _ in range(workers)
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            for thread in threads:
+                while thread.is_alive():
+                    thread.join(0.2)
+        except KeyboardInterrupt:
+            cancel.set()
+            for thread in threads:
+                while thread.is_alive():
+                    thread.join(0.2)
+            raise
+    if first_error:
+        raise first_error[0]
+    return sorted(unstarted)
+
+
 def convert_one(
     src: Path,
     final_dst: Path,
@@ -570,57 +670,60 @@ def convert_one(
     if cancel is not None and cancel.is_set():
         raise ConversionCancelled()
     try:
-        final_dst.parent.mkdir(parents=True, exist_ok=True)
+        _claim_dir(final_dst.parent)
     except OSError as exc:
         message = str(exc)
         emit(f"failed: {src}: {message}")
         return "failed", message
+    cleanup = False
     try:
-        info = probe(src, ffprobe)
-    except ProbeError as exc:
-        message = _without_path_prefix(src, str(exc))
-        _remove_dir_if_empty(final_dst.parent)
-        emit(f"failed: {src}: {message}")
-        return "failed", message
-    except OSError as exc:
-        message = str(exc)
-        _remove_dir_if_empty(final_dst.parent)
-        emit(f"failed: {src}: {message}")
-        return "failed", message
-    if opts.deinterlace and not info.interlaced:
-        emit(f"note: {src.name} is progressive; skipping deinterlace")
-    tmp_dst = final_dst.with_name(final_dst.name + ".part")
-    cmd = build_command(ffmpeg, src, tmp_dst, opts, info, force=True)
-    try:
-        ok, err = run_ffmpeg(
-            cmd,
-            final_dst,
-            tmp_dst,
-            _bar_total(info, opts),
-            src.name,
-            on_progress=on_progress,
-            cancel=cancel,
-        )
-    except KeyboardInterrupt:
-        raise
-    except ConversionCancelled:
-        _remove_dir_if_empty(final_dst.parent)
-        raise
-    except OSError as exc:
-        _remove_dir_if_empty(final_dst.parent)
-        emit(f"failed: {src}: {exc}")
-        return "failed", str(exc)
-    except Exception as exc:
-        _remove_dir_if_empty(final_dst.parent)
-        emit(f"failed: {src}: {exc}")
-        return "failed", str(exc)
-    if ok:
-        emit(f"wrote {final_dst}")
-        return "ok", ""
-    _remove_dir_if_empty(final_dst.parent)
-    emit(f"failed: {src}: {err}")
-    return "failed", err
-
+        try:
+            info = probe(src, ffprobe)
+        except ProbeError as exc:
+            message = _without_path_prefix(src, str(exc))
+            cleanup = True
+            emit(f"failed: {src}: {message}")
+            return "failed", message
+        except OSError as exc:
+            message = str(exc)
+            cleanup = True
+            emit(f"failed: {src}: {message}")
+            return "failed", message
+        if opts.deinterlace and not info.interlaced:
+            emit(f"note: {src.name} is progressive; skipping deinterlace")
+        tmp_dst = final_dst.with_name(final_dst.name + ".part")
+        cmd = build_command(ffmpeg, src, tmp_dst, opts, info, force=True)
+        try:
+            ok, err = run_ffmpeg(
+                cmd,
+                final_dst,
+                tmp_dst,
+                _bar_total(info, opts),
+                src.name,
+                on_progress=on_progress,
+                cancel=cancel,
+            )
+        except KeyboardInterrupt:
+            raise
+        except ConversionCancelled:
+            cleanup = True
+            raise
+        except OSError as exc:
+            cleanup = True
+            emit(f"failed: {src}: {exc}")
+            return "failed", str(exc)
+        except Exception as exc:
+            cleanup = True
+            emit(f"failed: {src}: {exc}")
+            return "failed", str(exc)
+        if ok:
+            emit(f"wrote {final_dst}")
+            return "ok", ""
+        cleanup = True
+        emit(f"failed: {src}: {err}")
+        return "failed", err
+    finally:
+        _release_dir(final_dst.parent, remove_if_empty=cleanup)
 
 def build_parser() -> argparse.ArgumentParser:
     class _Formatter(

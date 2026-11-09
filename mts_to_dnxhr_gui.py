@@ -48,6 +48,36 @@ _DROP_HOT = "#d6e8ff"
 _DROP_PAUSED_BG = "#d0d0d0"
 _DROP_PAUSED = "Converting… drops are paused"
 _IDLE_STATUS = "Add clips, choose an export folder, then click Convert."
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format a duration for the status line (``M:SS`` or ``H:MM:SS``)."""
+    if seconds < 0:
+        seconds = 0.0
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "{0}:{1:02d}:{2:02d}".format(hours, minutes, secs)
+    return "{0}:{1:02d}".format(minutes, secs)
+
+
+def running_prefix(
+    count: int,
+    active: Sequence[tuple[int, str, Optional[int]]],
+) -> str:
+    """Status-line prefix for the clips encoding right now."""
+    if not active:
+        return "Converting…"
+    if len(active) == 1:
+        index, name, pct = active[0]
+        if pct is None:
+            return "Converting {0} of {1}: {2}…".format(index + 1, count, name)
+        return "Converting {0} of {1}: {2} ({3}%)".format(index + 1, count, name, pct)
+    ids = ", ".join(str(index + 1) for index in sorted(item[0] for item in active))
+    return "Converting {0} at once ({1} of {2})".format(len(active), ids, count)
+
+
 _FFMPEG_MISSING = (
     "FFmpeg was not found. Install it with `winget install Gyan.FFmpeg` "
     "(then sign out and back in), or put ffmpeg.exe and ffprobe.exe next to this program."
@@ -217,80 +247,92 @@ def run_batch(
     ffprobe: str,
     post: Callable[[tuple], None],
     cancel: threading.Event,
+    jobs: int = 1,
 ) -> None:
     """Encode ``pairs`` and post progress events. Never exits without ``batch_finished``."""
     ok = 0
     skipped = 0
     failed = 0
     cancelled = 0
-    try:
-        total_files = len(pairs)
-        for index, (src, dst) in enumerate(pairs):
-            if cancel.is_set():
-                for later in range(index, total_files):
-                    post(("file_finished", later, "cancelled", ""))
-                    cancelled += 1
-                break
-            post(("file_started", index))
-            last_bucket = -2
+    tally = threading.Lock()
 
-            def on_progress(
-                seconds: float,
-                total: Optional[float],
-                file_index: int = index,
-            ) -> None:
-                nonlocal last_bucket
-                if total is None or total <= 0:
-                    fraction: Optional[float] = None
-                    bucket = -1
-                else:
-                    fraction = seconds / total
-                    if fraction < 0.0:
-                        fraction = 0.0
-                    elif fraction > 1.0:
-                        fraction = 1.0
-                    bucket = int(fraction * 100)
-                    if bucket > 100:
-                        bucket = 100
-                if bucket == last_bucket:
-                    return
-                last_bucket = bucket
-                post(("file_progress", file_index, fraction))
+    def work(index: int) -> None:
+        nonlocal ok, skipped, failed, cancelled
+        src, dst = pairs[index]
+        post(("file_started", index))
+        last_bucket = -2
 
-            try:
-                status, err = core.convert_one(
-                    src,
-                    dst,
-                    opts,
-                    ffmpeg,
-                    ffprobe,
-                    log=lambda _line: None,
-                    on_progress=on_progress,
-                    cancel=cancel,
-                )
-            except core.ConversionCancelled:
-                post(("file_finished", index, "cancelled", ""))
+        def on_progress(
+            seconds: float,
+            total: Optional[float],
+            file_index: int = index,
+        ) -> None:
+            nonlocal last_bucket
+            if total is None or total <= 0:
+                fraction: Optional[float] = None
+                bucket = -1
+            else:
+                fraction = seconds / total
+                if fraction < 0.0:
+                    fraction = 0.0
+                elif fraction > 1.0:
+                    fraction = 1.0
+                bucket = int(fraction * 100)
+                if bucket > 100:
+                    bucket = 100
+            if bucket == last_bucket:
+                return
+            last_bucket = bucket
+            post(("file_progress", file_index, fraction))
+
+        try:
+            status, err = core.convert_one(
+                src,
+                dst,
+                opts,
+                ffmpeg,
+                ffprobe,
+                log=lambda _line: None,
+                on_progress=on_progress,
+                cancel=cancel,
+            )
+        except core.ConversionCancelled:
+            post(("file_finished", index, "cancelled", ""))
+            with tally:
                 cancelled += 1
-                for later in range(index + 1, total_files):
-                    post(("file_finished", later, "cancelled", ""))
-                    cancelled += 1
-                break
-            except Exception as exc:
-                post(("file_finished", index, "failed", str(exc)))
+            cancel.set()
+            return
+        except Exception as exc:
+            post(("file_finished", index, "failed", str(exc)))
+            with tally:
                 failed += 1
-                continue
-            if status not in ("ok", "skipped", "failed"):
-                err = err or "unexpected status {0}".format(status)
-                status = "failed"
+            return
+        if status not in ("ok", "skipped", "failed"):
+            err = err or "unexpected status {0}".format(status)
+            status = "failed"
+        with tally:
             if status == "ok":
                 ok += 1
             elif status == "skipped":
                 skipped += 1
             else:
                 failed += 1
-            post(("file_finished", index, status, err))
+        post(("file_finished", index, status, err))
+
+    try:
+        unstarted = core.run_indexed(len(pairs), jobs, work, cancel)
+        for index in unstarted:
+            post(("file_finished", index, "cancelled", ""))
+            cancelled += 1
     finally:
         post(("batch_finished", ok, skipped, failed, cancelled))
+
+
+@dataclasses.dataclass
+class _ActiveFile:
+    t0: float
+    pct: Optional[int]
+    fraction: float
 
 
 class App:
@@ -319,9 +361,10 @@ class App:
         self.worker: Optional[threading.Thread] = None
         self.ffmpeg, self.ffprobe = locate_tools()
         self._finished_files = 0
-        self._current_fraction = 0.0
-        self._known_total = True
         self._quit_deadline = 0.0
+        self._batch_t0: Optional[float] = None
+        self._active: dict[int, _ActiveFile] = {}
+        self._batch_jobs = 1
 
         self._build()
         self._apply_tools_banner()
@@ -338,16 +381,16 @@ class App:
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
 
-        self.drop = tk.Frame(outer, relief="groove", bd=2, bg=_DROP_BG, height=110)
+        self.drop = tk.Frame(outer, relief="groove", bd=2, bg=_DROP_BG)
         self.drop.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        # Children are packed, so pack_propagate is what keeps the 110 px height.
-        self.drop.pack_propagate(False)
+        # No fixed height: the frame sizes from label + button row so buttons
+        # are never clipped at high DPI.
         self.drop_label = tk.Label(
             self.drop,
             text=_DROP_TEXT if self.dnd else _DROP_TEXT_NO_DND,
             bg=_DROP_BG,
         )
-        self.drop_label.pack(pady=(22, 8))
+        self.drop_label.pack(pady=(8, 6))
         button_row = tk.Frame(self.drop, bg=_DROP_BG)
         button_row.pack()
         self._drop_fill = (self.drop, self.drop_label, button_row)
@@ -413,15 +456,34 @@ class App:
         )
         self.deinterlace_chk.grid(row=4, column=0, sticky="w", pady=(0, 4))
 
+        jobs_row = ttk.Frame(outer)
+        jobs_row.grid(row=5, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(jobs_row, text="Parallel encodes:").pack(side="left")
+        self.jobs_var = tk.IntVar(value=1)
+        self.jobs_spin = ttk.Spinbox(
+            jobs_row,
+            from_=1,
+            to=core.MAX_JOBS,
+            width=3,
+            textvariable=self.jobs_var,
+            state="readonly",
+        )
+        self.jobs_spin.pack(side="left", padx=(6, 6))
+        ttk.Label(
+            jobs_row,
+            text="(suggested max {0} for this PC)".format(core.suggested_jobs()),
+            foreground="#666666",
+        ).pack(side="left")
+
         self.summary = ttk.Label(
             outer,
             text="Output: {0}".format(OUTPUT_SUMMARY),
             foreground="#666666",
         )
-        self.summary.grid(row=5, column=0, sticky="w", pady=(0, 4))
+        self.summary.grid(row=6, column=0, sticky="w", pady=(0, 4))
 
         self.banner = tk.Frame(outer)
-        self.banner.grid(row=6, column=0, sticky="ew", pady=(0, 4))
+        self.banner.grid(row=7, column=0, sticky="ew", pady=(0, 4))
         self.banner.columnconfigure(0, weight=1)
         self.banner_label = tk.Label(
             self.banner,
@@ -436,14 +498,14 @@ class App:
         self.check_btn.grid(row=0, column=1, padx=(8, 0))
 
         ttk.Separator(outer, orient="horizontal").grid(
-            row=7, column=0, sticky="ew", pady=8
+            row=8, column=0, sticky="ew", pady=8
         )
         self.status_var = tk.StringVar(value=_IDLE_STATUS)
-        ttk.Label(outer, textvariable=self.status_var).grid(row=8, column=0, sticky="w")
+        ttk.Label(outer, textvariable=self.status_var).grid(row=9, column=0, sticky="w")
         self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100)
-        self.progress.grid(row=9, column=0, sticky="ew", pady=(6, 0))
+        self.progress.grid(row=10, column=0, sticky="ew", pady=(6, 0))
         actions = ttk.Frame(outer)
-        actions.grid(row=10, column=0, sticky="ew", pady=(8, 0))
+        actions.grid(row=11, column=0, sticky="ew", pady=(8, 0))
         self.convert_btn = ttk.Button(
             actions,
             text="Convert",
@@ -664,6 +726,7 @@ class App:
         self.browse_btn.configure(state=busy)
         self.export_entry.configure(state="normal")
         self.deinterlace_chk.configure(state="normal")
+        self.jobs_spin.configure(state="readonly")
         ready = bool(self.items) and bool(self.export_var.get().strip()) and self._tools_ready()
         self.convert_btn.configure(text="Convert", state="normal" if ready else "disabled")
 
@@ -676,6 +739,7 @@ class App:
         self.browse_btn.configure(state=state)
         self.export_entry.configure(state=state)
         self.deinterlace_chk.configure(state=state)
+        self.jobs_spin.configure(state="disabled" if running else "readonly")
         if running:
             self.convert_btn.configure(text="Stop", state="normal")
         else:
@@ -756,9 +820,14 @@ class App:
         for index in range(len(self.items)):
             self.errors[index] = ""
             self._set_status_cell(index, "Waiting")
+        try:
+            jobs = max(1, min(core.MAX_JOBS, int(self.jobs_var.get())))
+        except (tk.TclError, ValueError):
+            jobs = 1
         self._finished_files = 0
-        self._current_fraction = 0.0
-        self._known_total = True
+        self._active = {}
+        self._batch_jobs = jobs
+        self._batch_t0 = time.monotonic()
         self.progress["value"] = 0
         self.cancel = threading.Event()
         self.running = True
@@ -767,6 +836,7 @@ class App:
         self.worker = threading.Thread(
             target=run_batch,
             args=(pairs, opts, self.ffmpeg, self.ffprobe, self.events.put, self.cancel),
+            kwargs={"jobs": jobs},
             daemon=True,
         )
         self.worker.start()
@@ -788,10 +858,11 @@ class App:
         self._handle_event(pending)
 
     def _confirm_stop(self) -> None:
-        yes = self._ask_yes_no(
-            "Stop converting?",
-            "The file being converted now will be deleted. Finished files are kept.",
-        )
+        if self._batch_jobs > 1:
+            message = "Files being converted now will be deleted. Finished files are kept."
+        else:
+            message = "The file being converted now will be deleted. Finished files are kept."
+        yes = self._ask_yes_no("Stop converting?", message)
         if self._pending_finish is not None:
             self._show_pending_finish()
             return
@@ -799,12 +870,70 @@ class App:
             return
         self.cancel.set()
         self.convert_btn.configure(state="disabled")
-        self.status_var.set("Stopping…")
+        self.status_var.set(self._with_times("Stopping…", include_file=False))
 
     def _poll(self) -> None:
         self._drain_events()
         if self.running:
+            self._refresh_running_status()
             self.root.after(100, self._poll)
+
+    def _elapsed_batch(self) -> Optional[float]:
+        if self._batch_t0 is None:
+            return None
+        return time.monotonic() - self._batch_t0
+
+    def _with_times(self, prefix: str, *, include_file: bool = True) -> str:
+        """Append `` · file M:SS · total M:SS`` when timers are running."""
+        parts = [prefix]
+        if include_file and len(self._active) == 1:
+            entry = next(iter(self._active.values()))
+            parts.append("file {0}".format(format_elapsed(time.monotonic() - entry.t0)))
+        batch_secs = self._elapsed_batch()
+        if batch_secs is not None:
+            parts.append("total {0}".format(format_elapsed(batch_secs)))
+        if len(parts) == 1:
+            return prefix
+        return " · ".join(parts)
+
+    def _running_prefix(self) -> str:
+        count = len(self.items)
+        active: list[tuple[int, str, Optional[int]]] = []
+        for index, entry in self._active.items():
+            if index < 0 or index >= count:
+                continue
+            active.append((index, self.items[index].src.name, entry.pct))
+        return running_prefix(count, active)
+
+    def _active_row_text(self, entry: _ActiveFile) -> str:
+        if entry.pct is None:
+            label = "Converting…"
+        else:
+            label = "{0}%".format(entry.pct)
+        if self._batch_jobs <= 1:
+            return label
+        return "{0} · {1}".format(label, format_elapsed(time.monotonic() - entry.t0))
+
+    def _refresh_running_status(self) -> None:
+        if not self.running or self._quitting:
+            return
+        if self._batch_jobs > 1:
+            children = self.tree.get_children()
+            for index, entry in list(self._active.items()):
+                if index < 0 or index >= len(children):
+                    continue
+                text = self._active_row_text(entry)
+                values = self.tree.item(children[index], "values")
+                if len(values) >= 3 and values[2] == text:
+                    continue
+                self._set_status_cell(index, text)
+        text = self.status_var.get()
+        if text.startswith("Stopping"):
+            self.status_var.set(self._with_times("Stopping…", include_file=False))
+            return
+        if not self._active:
+            return
+        self.status_var.set(self._with_times(self._running_prefix()))
 
     def _drain_events(self) -> None:
         try:
@@ -825,40 +954,31 @@ class App:
             self.running = False
             return
         kind = event[0]
-        count = len(self.items)
         if kind == "file_started":
             index = event[1]
-            self._current_fraction = 0.0
-            self._known_total = True
-            self._set_status_cell(index, "0%")
-            name = self.items[index].src.name
-            self.status_var.set(
-                "Converting {0} of {1}: {2} (0%)".format(index + 1, count, name)
-            )
+            entry = _ActiveFile(time.monotonic(), 0, 0.0)
+            self._active[index] = entry
+            self._set_status_cell(index, self._active_row_text(entry))
+            self.status_var.set(self._with_times(self._running_prefix()))
             self._update_overall()
         elif kind == "file_progress":
             index = event[1]
             fraction = event[2]
-            name = self.items[index].src.name
-            if fraction is None:
-                self._known_total = False
-                self._current_fraction = 0.0
-                self._set_status_cell(index, "Converting…")
-                self.status_var.set(
-                    "Converting {0} of {1}: {2}…".format(index + 1, count, name)
-                )
-            else:
-                self._known_total = True
-                self._current_fraction = fraction
-                pct = int(fraction * 100)
-                if pct < 0:
-                    pct = 0
-                elif pct > 100:
-                    pct = 100
-                self._set_status_cell(index, "{0}%".format(pct))
-                self.status_var.set(
-                    "Converting {0} of {1}: {2} ({3}%)".format(index + 1, count, name, pct)
-                )
+            entry = self._active.get(index)
+            if entry is not None:
+                if fraction is None:
+                    entry.pct = None
+                    entry.fraction = 0.0
+                else:
+                    pct = int(fraction * 100)
+                    if pct < 0:
+                        pct = 0
+                    elif pct > 100:
+                        pct = 100
+                    entry.pct = pct
+                    entry.fraction = fraction
+                self._set_status_cell(index, self._active_row_text(entry))
+            self.status_var.set(self._with_times(self._running_prefix()))
             self._update_overall()
         elif kind == "file_finished":
             index = event[1]
@@ -870,34 +990,47 @@ class App:
                 "failed": "Failed (double-click for details)",
                 "cancelled": "Cancelled",
             }.get(status, "Failed (double-click for details)")
+            entry = self._active.pop(index, None)
+            if entry is not None and status in ("ok", "failed", "cancelled", "skipped"):
+                text = "{0} ({1})".format(text, format_elapsed(time.monotonic() - entry.t0))
             self._set_status_cell(index, text)
             if index < len(self.errors):
                 self.errors[index] = err if status == "failed" else ""
             self._finished_files += 1
-            self._current_fraction = 0.0
-            self._known_total = True
             self._update_overall()
         elif kind == "batch_finished":
             _ok, _skipped, failed, cancelled = event[1], event[2], event[3], event[4]
             summary = self._summary_line(event[1], event[2], failed, cancelled)
             self.running = False
+            self._active.clear()
+            self._batch_jobs = 1
             self._set_running_ui(False)
             self.status_var.set(summary)
             self._show_finished(summary, failed)
 
     def _summary_line(self, ok: int, skipped: int, failed: int, cancelled: int) -> str:
         if cancelled:
-            return (
+            line = (
                 "Stopped: {0} converted, {1} skipped, {2} failed, {3} not converted."
             ).format(ok, skipped, failed, cancelled)
-        return "Finished: {0} converted, {1} skipped, {2} failed.".format(ok, skipped, failed)
+        else:
+            line = "Finished: {0} converted, {1} skipped, {2} failed.".format(
+                ok, skipped, failed
+            )
+        batch_secs = self._elapsed_batch()
+        if batch_secs is not None:
+            line = "{0} · Total {1}".format(line, format_elapsed(batch_secs))
+        return line
 
     def _update_overall(self) -> None:
         count = len(self.items)
         if count <= 0:
             self.progress["value"] = 0
             return
-        current = self._current_fraction if self._known_total else 0.0
+        current = 0.0
+        for entry in self._active.values():
+            if entry.pct is not None:
+                current += entry.fraction
         self.progress["value"] = (self._finished_files + current) / count * 100.0
 
     def _failed_names(self) -> list[str]:

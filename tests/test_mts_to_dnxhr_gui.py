@@ -36,6 +36,15 @@ def _progressive() -> core.ProbeInfo:
     )
 
 
+class FormatElapsedTests(unittest.TestCase):
+    def test_minutes_and_hours(self) -> None:
+        self.assertEqual(gui.format_elapsed(0), "0:00")
+        self.assertEqual(gui.format_elapsed(5.9), "0:05")
+        self.assertEqual(gui.format_elapsed(83), "1:23")
+        self.assertEqual(gui.format_elapsed(3723), "1:02:03")
+        self.assertEqual(gui.format_elapsed(-1), "0:00")
+
+
 class DefaultsTests(unittest.TestCase):
     def test_defaults_match_cli_encode_argv(self) -> None:
         args = core.build_parser().parse_args(["clip.mts"])
@@ -346,6 +355,133 @@ class RunBatchTests(unittest.TestCase):
         self.assertEqual(len(finished), count)
         self.assertTrue(all(event[2] == "cancelled" for event in finished))
         self.assertEqual(events[-1], ("batch_finished", 0, 0, 0, count))
+
+    def test_jobs_two_overlap_finishes_each_row_once(self) -> None:
+        barrier = gui.threading.Barrier(2, timeout=5)
+
+        def fake_convert(*_args: object, **_kwargs: object) -> tuple[str, str]:
+            barrier.wait()
+            return "ok", ""
+
+        events: list[tuple] = []
+        with mock.patch.object(gui.core, "convert_one", side_effect=fake_convert):
+            gui.run_batch(
+                self._pairs(2),
+                gui.DEFAULT_OPTIONS,
+                "ffmpeg",
+                "ffprobe",
+                events.append,
+                gui.threading.Event(),
+                jobs=2,
+            )
+        first_finished = next(
+            index for index, event in enumerate(events) if event[0] == "file_finished"
+        )
+        started_before = [
+            event for event in events[:first_finished] if event[0] == "file_started"
+        ]
+        self.assertEqual(len(started_before), 2)
+        finished = [event for event in events if event[0] == "file_finished"]
+        self.assertEqual(sorted(event[1] for event in finished), [0, 1])
+        for index in (0, 1):
+            start_at = next(
+                position
+                for position, event in enumerate(events)
+                if event[0] == "file_started" and event[1] == index
+            )
+            finish_at = next(
+                position
+                for position, event in enumerate(events)
+                if event[0] == "file_finished" and event[1] == index
+            )
+            self.assertLess(start_at, finish_at)
+        self.assertEqual(events[-1], ("batch_finished", 2, 0, 0, 0))
+
+    def test_jobs_two_cancel_mid_batch_finishes_every_row(self) -> None:
+        cancel = gui.threading.Event()
+        lock = gui.threading.Lock()
+        calls = {"n": 0}
+
+        def fake_convert(*_args: object, **_kwargs: object) -> tuple[str, str]:
+            with lock:
+                calls["n"] += 1
+                call = calls["n"]
+            if call == 2:
+                cancel.set()
+                raise core.ConversionCancelled()
+            return "ok", ""
+
+        events: list[tuple] = []
+        with mock.patch.object(gui.core, "convert_one", side_effect=fake_convert):
+            gui.run_batch(
+                self._pairs(4),
+                gui.DEFAULT_OPTIONS,
+                "ffmpeg",
+                "ffprobe",
+                events.append,
+                cancel,
+                jobs=2,
+            )
+        finished = [event for event in events if event[0] == "file_finished"]
+        self.assertEqual(sorted(event[1] for event in finished), [0, 1, 2, 3])
+        counts = events[-1]
+        self.assertEqual(counts[0], "batch_finished")
+        self.assertEqual(counts[1] + counts[4], 4)
+        self.assertEqual(counts[2], 0)
+        self.assertEqual(counts[3], 0)
+
+    def test_parallel_progress_throttling_is_independent(self) -> None:
+        barrier = gui.threading.Barrier(2, timeout=5)
+
+        def fake_convert(*_args: object, **kwargs: object) -> tuple[str, str]:
+            barrier.wait()
+            on_progress = kwargs["on_progress"]
+            for step in range(1000):
+                on_progress(step * 10.0 / 1000.0, 10.0)  # type: ignore[operator]
+            return "ok", ""
+
+        events: list[tuple] = []
+        with mock.patch.object(gui.core, "convert_one", side_effect=fake_convert):
+            gui.run_batch(
+                self._pairs(2),
+                gui.DEFAULT_OPTIONS,
+                "ffmpeg",
+                "ffprobe",
+                events.append,
+                gui.threading.Event(),
+                jobs=2,
+            )
+        for index in (0, 1):
+            fractions = [
+                event[2]
+                for event in events
+                if event[0] == "file_progress" and event[1] == index
+            ]
+            self.assertLessEqual(len(fractions), 101)
+            self.assertGreater(len(fractions), 1)
+            self.assertEqual(fractions, sorted(fractions))
+
+    def test_running_prefix_formats_zero_one_and_many(self) -> None:
+        self.assertEqual(gui.running_prefix(4, []), "Converting…")
+        self.assertEqual(
+            gui.running_prefix(10, [(2, "clip.MTS", 42)]),
+            "Converting 3 of 10: clip.MTS (42%)",
+        )
+        self.assertEqual(
+            gui.running_prefix(10, [(2, "clip.MTS", None)]),
+            "Converting 3 of 10: clip.MTS…",
+        )
+        self.assertEqual(
+            gui.running_prefix(10, [(2, "a.MTS", 1), (3, "b.MTS", 2)]),
+            "Converting 2 at once (3, 4 of 10)",
+        )
+        self.assertEqual(
+            gui.running_prefix(
+                10,
+                [(3, "c.MTS", 1), (0, "a.MTS", 2), (1, "b.MTS", 3)],
+            ),
+            "Converting 3 at once (1, 2, 4 of 10)",
+        )
 
 
 class ToolLookupTests(unittest.TestCase):

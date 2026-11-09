@@ -102,7 +102,7 @@ Exit codes: `0` every file converted or skipped, `1` at least one file failed (t
 
 ## Desktop app (Windows)
 
-The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. Under that checkbox, **Parallel encodes** runs from 1 to 4 clips at once and defaults to 1. A grey hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
 
 Run it from source, from the repo root:
 
