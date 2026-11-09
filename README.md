@@ -57,6 +57,21 @@ Checked against `samples/01 American Landscape.MTS` (H.264 1920×1080, `field_or
 - `--deinterlace` for 10 seconds stayed at `30000/1001` and 300 frames.
 - 3-second video bitrates: LB 45.2 Mb/s, SQ 145.3 Mb/s, HQ 220.0 Mb/s, HQX 220.0 Mb/s, 444 440.0 Mb/s. All are within 10% of the table. HQ and HQX were the same size.
 
+Four copies of that sample, first 30 seconds each, default HQX MOV, written to an NVMe SSD on this PC (20 logical processors). Wall time is for the whole batch. Peak RAM is the highest sampled sum of `ffmpeg.exe` working sets. Write rate is output bytes divided by wall time.
+
+| Jobs | Deinterlace | Wall | Peak RAM | Write |
+| --- | --- | --- | --- | --- |
+| 1 | no | 24.0 s | 1.8 GB | 139 MB/s |
+| 2 | no | 19.2 s | 3.6 GB | 173 MB/s |
+| 3 | no | 19.9 s | 5.4 GB | 167 MB/s |
+| 4 | no | 18.5 s | 7.1 GB | 180 MB/s |
+| 1 | yes | 20.9 s | 1.8 GB | 159 MB/s |
+| 2 | yes | 18.4 s | 3.6 GB | 181 MB/s |
+| 3 | yes | 18.2 s | 5.4 GB | 183 MB/s |
+| 4 | yes | 17.3 s | 7.2 GB | 192 MB/s |
+
+Two streams were faster than one. A third was not, so the suggestion caps at 2. Each ffmpeg process used about 1.8 GB.
+
 ## Usage
 
 Quote paths that contain spaces.
@@ -92,11 +107,14 @@ Encode a few seconds while trying settings. This is a testing aid, not a trimmer
 
 ```powershell
 python mts_to_dnxhr.py "samples/01 American Landscape.MTS" --duration 3 -o converted/
+python mts_to_dnxhr.py ./footage/ --jobs 2
 ```
 
 `converted/` is gitignored. Delete it when you are done; it is only a scratch folder.
 
-Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite`, `--output`, `--recursive`. `--help` lists them.
+`--jobs N` encodes up to N clips at once (1-4, default 1). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Parallel encodes do not change the ffmpeg command.
+
+Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite`, `--output`, `--recursive`, `--jobs`. `--help` lists them.
 
 Exit codes: `0` every file converted or skipped, `1` at least one file failed (the batch continues), `2` usage or preflight error (bad path, no clips, FFmpeg missing, two inputs mapping to one output), `130` interrupted. Ctrl+C stops ffmpeg and deletes the partial file.
 
@@ -171,10 +189,10 @@ See `samples/README.md`. Media in that folder is gitignored and must not be comm
 ## Limitations
 
 - There is a minimal Windows GUI (DNxHR HQX, MOV, and 16-bit PCM only; use the CLI for other profiles). No installer, code signing, `pyproject.toml`, or bundled FFmpeg.
-- Encodes run one at a time, in software. There is no GPU encoder and no parallel batch.
+- Encodes run in software. Up to 4 clips can encode at once (default 1). There is no GPU encoder.
 - Spanned AVCHD recordings stay as separate files. Each clip converts on its own, so there is a cut at each file boundary. Frames are not dropped. Joining them, reading `.MPL` playlists, and preserving camera timecode are out of scope.
 - No 59.94p (field-rate) deinterlace, scaling, frame-rate conversion, color tagging, or LUTs.
 - Inputs other than `.MTS` and `.M2TS` are rejected.
 - 1440×1080 anamorphic AVCHD is untested. The only sample here is 1920×1080. DNxHR can store 1440×1080, but the sample aspect ratio has to survive for Resolve to show it at 16:9.
-- Outputs are much larger than the camera files. A batch can fail midway if the disk fills. The failure is reported for that file, the `.part` file is removed, and later files are still attempted.
+- Outputs are much larger than the camera files. A batch can fail midway if the disk fills. The failure is reported for that file, the `.part` file is removed, and later files are still attempted. With several parallel encodes, a full disk can fail every in-flight file at once.
 - If a future FFmpeg changes the `-progress` keys, the time bar falls back to elapsed time. The encode itself is unchanged.

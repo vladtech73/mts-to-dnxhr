@@ -725,6 +725,21 @@ def convert_one(
     finally:
         _release_dir(final_dst.parent, remove_if_empty=cleanup)
 
+
+def _jobs_arg(value: str) -> int:
+    try:
+        jobs = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "jobs must be an integer from 1 to {0}".format(MAX_JOBS)
+        ) from exc
+    if jobs < 1 or jobs > MAX_JOBS:
+        raise argparse.ArgumentTypeError(
+            "jobs must be an integer from 1 to {0}".format(MAX_JOBS)
+        )
+    return jobs
+
+
 def build_parser() -> argparse.ArgumentParser:
     class _Formatter(
         argparse.ArgumentDefaultsHelpFormatter,
@@ -804,6 +819,16 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="Encode only the first N seconds (testing aid)",
     )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=_jobs_arg,
+        default=1,
+        metavar="N",
+        help=(
+            "Encode up to N clips at once (1-{0}). Suggested for this PC: {1}"
+        ).format(MAX_JOBS, suggested_jobs()),
+    )
     return parser
 
 
@@ -812,6 +837,7 @@ def _print_header(
     skipped: int,
     opts: Options,
     out_dir: Path,
+    jobs: int,
 ) -> None:
     print(f"inputs: {len(inputs)}")
     print(f"skipped non-MTS: {skipped}")
@@ -819,6 +845,10 @@ def _print_header(
     print(f"container: {opts.container}")
     print(f"audio: {AUDIO_CODECS[opts.audio_bit_depth]}")
     print(f"output: {out_dir}")
+    print(f"jobs: {jobs}")
+    suggested = suggested_jobs()
+    if jobs > suggested:
+        print(f"note: --jobs {jobs} is above the suggested {suggested} for this PC")
 
 
 def _report_collisions(collisions: dict[Path, list[Path]]) -> None:
@@ -869,22 +899,57 @@ def _encode_all(
     opts: Options,
     ffmpeg: str,
     ffprobe: str,
+    jobs: int = 1,
 ) -> int:
     converted = 0
     skipped = 0
     failed = 0
     failures: list[tuple[Path, str]] = []
     try:
-        with tqdm(pairs, unit="file", desc="files") as bar:
-            for src, dst in bar:
-                status, err = convert_one(src, dst, opts, ffmpeg, ffprobe)
-                if status == "ok":
-                    converted += 1
-                elif status == "skipped":
-                    skipped += 1
-                else:
-                    failed += 1
-                    failures.append((src, err))
+        if jobs == 1:
+            with tqdm(pairs, unit="file", desc="files") as bar:
+                for src, dst in bar:
+                    status, err = convert_one(src, dst, opts, ffmpeg, ffprobe)
+                    if status == "ok":
+                        converted += 1
+                    elif status == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
+                        failures.append((src, err))
+        else:
+            cancel = threading.Event()
+            lock = threading.Lock()
+            with tqdm(total=len(pairs), unit="file", desc="files") as bar:
+
+                def work(index: int) -> None:
+                    nonlocal converted, skipped, failed
+                    src, dst = pairs[index]
+                    try:
+                        status, err = convert_one(
+                            src,
+                            dst,
+                            opts,
+                            ffmpeg,
+                            ffprobe,
+                            on_progress=lambda _s, _t: None,
+                            cancel=cancel,
+                        )
+                    except ConversionCancelled:
+                        with lock:
+                            bar.update(1)
+                        return
+                    with lock:
+                        if status == "ok":
+                            converted += 1
+                        elif status == "skipped":
+                            skipped += 1
+                        else:
+                            failed += 1
+                            failures.append((src, err))
+                        bar.update(1)
+
+                run_indexed(len(pairs), jobs, work, cancel)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
@@ -953,11 +1018,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(INSTALL_HINT, file=sys.stderr)
         return 2
 
-    _print_header(inputs, skipped, opts, out_dir)
+    _print_header(inputs, skipped, opts, out_dir, args.jobs)
     if args.dry_run:
         return _dry_run(pairs, opts, ffmpeg, ffprobe)
     assert ffmpeg is not None and ffprobe is not None
-    return _encode_all(pairs, opts, ffmpeg, ffprobe)
+    return _encode_all(pairs, opts, ffmpeg, ffprobe, args.jobs)
 
 
 if __name__ == "__main__":
