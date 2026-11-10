@@ -1368,7 +1368,7 @@ class App:
             style="Accent.TButton",
             width=16,
         )
-        self.convert_btn.pack(side="right")
+        self.convert_btn.pack(side="left")
 
     def _register_drop(self, widget: tk.Widget) -> None:
         if not self.dnd or DND_FILES is None:
