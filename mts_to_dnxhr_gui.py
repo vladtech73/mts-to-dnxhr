@@ -494,6 +494,12 @@ def collect_items(
             ignored += 1
         except (ValueError, OSError):
             ignored += 1
+    new_items.sort(
+        key=lambda item: (
+            natural_key(item.src.name),
+            natural_key(str(item.src.parent)),
+        )
+    )
     return new_items, ignored
 
 
@@ -1273,22 +1279,6 @@ class App:
 
         options = ttk.Frame(settings)
         options.grid(row=1, column=0, sticky="ew")
-        self.deinterlace_var = tk.BooleanVar(value=False)
-        self.deinterlace_chk = ttk.Checkbutton(
-            options,
-            text="Deinterlace interlaced (1080i) clips",
-            variable=self.deinterlace_var,
-            style=_CHECKBOX_STYLE,
-        )
-        self.deinterlace_chk.pack(side="left", padx=(0, self._px(12)))
-        self.gpu_decode_var = tk.BooleanVar(value=DEFAULT_OPTIONS.hwaccel != "off")
-        self.gpu_decode_chk = ttk.Checkbutton(
-            options,
-            text="GPU decode (hardware)",
-            variable=self.gpu_decode_var,
-            style=_CHECKBOX_STYLE,
-        )
-        self.gpu_decode_chk.pack(side="left", padx=(0, self._px(12)))
         # Concurrent convert jobs (each job already includes decode + DNxHR encode).
         ttk.Label(options, text="Parallel streams:").pack(side="left")
         self.jobs_var = tk.IntVar(value=2)
@@ -1304,7 +1294,23 @@ class App:
             options,
             text="(suggested max {0} for this PC)".format(core.suggested_jobs()),
             style="Secondary.TLabel",
-        ).pack(side="left")
+        ).pack(side="left", padx=(0, self._px(12)))
+        self.gpu_decode_var = tk.BooleanVar(value=DEFAULT_OPTIONS.hwaccel != "off")
+        self.gpu_decode_chk = ttk.Checkbutton(
+            options,
+            text="GPU decode (hardware)",
+            variable=self.gpu_decode_var,
+            style=_CHECKBOX_STYLE,
+        )
+        self.gpu_decode_chk.pack(side="left", padx=(0, self._px(12)))
+        self.deinterlace_var = tk.BooleanVar(value=False)
+        self.deinterlace_chk = ttk.Checkbutton(
+            options,
+            text="Deinterlace interlaced (1080i) clips",
+            variable=self.deinterlace_var,
+            style=_CHECKBOX_STYLE,
+        )
+        self.deinterlace_chk.pack(side="left")
 
         self.summary = ttk.Label(
             outer,

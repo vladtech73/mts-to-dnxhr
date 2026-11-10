@@ -136,6 +136,20 @@ class CollectItemsTests(unittest.TestCase):
         again, _ignored_again = gui.collect_items(paths, items)
         self.assertEqual(again, [])
 
+    def test_dropped_group_is_alphabetical(self) -> None:
+        names = ["clip10.MTS", "Clip2.MTS", "clip1.mts", "00000.MTS"]
+        paths = []
+        for name in names:
+            path = self.root / name
+            path.write_bytes(b"")
+            paths.append(path)
+        items, ignored = gui.collect_items(paths, [])
+        self.assertEqual(ignored, 0)
+        self.assertEqual(
+            [item.src.name for item in items],
+            ["00000.MTS", "clip1.mts", "Clip2.MTS", "clip10.MTS"],
+        )
+
     @unittest.skipUnless(os.name == "nt", "Windows path case folding")
     def test_case_variant_duplicates_are_deduped(self) -> None:
         clip = self.root / "Clip.MTS"
