@@ -99,9 +99,10 @@ def _parser_defaults() -> core.Options:
         profile=args.profile,
         container=args.container,
         audio_bit_depth=args.audio_bit_depth,
-        deinterlace=False,
-        overwrite=False,
-        duration=None,
+        deinterlace=args.deinterlace,
+        overwrite=args.overwrite,
+        duration=args.duration,
+        hwaccel=args.hwaccel,
     )
 
 
@@ -112,8 +113,12 @@ OUTPUT_SUMMARY = (
 )
 
 
-def options_for(deinterlace: bool) -> core.Options:
-    return dataclasses.replace(DEFAULT_OPTIONS, deinterlace=deinterlace)
+def options_for(deinterlace: bool, *, gpu_decode: bool = True) -> core.Options:
+    return dataclasses.replace(
+        DEFAULT_OPTIONS,
+        deinterlace=deinterlace,
+        hwaccel="cuda" if gpu_decode else "off",
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -341,7 +346,7 @@ class App:
     def __init__(self, root: tk.Tk, dnd: Optional[bool] = None) -> None:
         self.root = root
         self.root.title("MTS to DNxHR")
-        self.root.geometry("720x540")
+        self.root.geometry("1024x600")
         self.root.minsize(560, 440)
         if sys.platform == "win32":
             try:
@@ -390,9 +395,9 @@ class App:
             text=_DROP_TEXT if self.dnd else _DROP_TEXT_NO_DND,
             bg=_DROP_BG,
         )
-        self.drop_label.pack(pady=(8, 6))
+        self.drop_label.pack(pady=(12, 8))
         button_row = tk.Frame(self.drop, bg=_DROP_BG)
-        button_row.pack()
+        button_row.pack(pady=(0, 14))
         self._drop_fill = (self.drop, self.drop_label, button_row)
         self.add_files_btn = ttk.Button(button_row, text="Add files…", command=self.add_files)
         self.add_files_btn.pack(side="left", padx=4)
@@ -456,8 +461,16 @@ class App:
         )
         self.deinterlace_chk.grid(row=4, column=0, sticky="w", pady=(0, 4))
 
+        self.gpu_decode_var = tk.BooleanVar(value=DEFAULT_OPTIONS.hwaccel != "off")
+        self.gpu_decode_chk = ttk.Checkbutton(
+            outer,
+            text="GPU decode (hardware)",
+            variable=self.gpu_decode_var,
+        )
+        self.gpu_decode_chk.grid(row=5, column=0, sticky="w", pady=(0, 4))
+
         jobs_row = ttk.Frame(outer)
-        jobs_row.grid(row=5, column=0, sticky="w", pady=(0, 4))
+        jobs_row.grid(row=6, column=0, sticky="w", pady=(0, 4))
         ttk.Label(jobs_row, text="Parallel encodes:").pack(side="left")
         self.jobs_var = tk.IntVar(value=1)
         self.jobs_spin = ttk.Spinbox(
@@ -480,10 +493,10 @@ class App:
             text="Output: {0}".format(OUTPUT_SUMMARY),
             foreground="#666666",
         )
-        self.summary.grid(row=6, column=0, sticky="w", pady=(0, 4))
+        self.summary.grid(row=7, column=0, sticky="w", pady=(0, 4))
 
         self.banner = tk.Frame(outer)
-        self.banner.grid(row=7, column=0, sticky="ew", pady=(0, 4))
+        self.banner.grid(row=8, column=0, sticky="ew", pady=(0, 4))
         self.banner.columnconfigure(0, weight=1)
         self.banner_label = tk.Label(
             self.banner,
@@ -498,14 +511,21 @@ class App:
         self.check_btn.grid(row=0, column=1, padx=(8, 0))
 
         ttk.Separator(outer, orient="horizontal").grid(
-            row=8, column=0, sticky="ew", pady=8
+            row=9, column=0, sticky="ew", pady=8
         )
         self.status_var = tk.StringVar(value=_IDLE_STATUS)
-        ttk.Label(outer, textvariable=self.status_var).grid(row=9, column=0, sticky="w")
-        self.progress = ttk.Progressbar(outer, mode="determinate", maximum=100)
-        self.progress.grid(row=10, column=0, sticky="ew", pady=(6, 0))
+        ttk.Label(outer, textvariable=self.status_var).grid(row=10, column=0, sticky="w")
+        progress_row = ttk.Frame(outer)
+        progress_row.grid(row=11, column=0, sticky="ew", pady=(6, 0))
+        progress_row.columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(progress_row, mode="determinate", maximum=100)
+        self.progress.grid(row=0, column=0, sticky="ew")
+        self.overall_pct_var = tk.StringVar(value="")
+        ttk.Label(progress_row, textvariable=self.overall_pct_var, width=5).grid(
+            row=0, column=1, sticky="e", padx=(8, 0)
+        )
         actions = ttk.Frame(outer)
-        actions.grid(row=11, column=0, sticky="ew", pady=(8, 0))
+        actions.grid(row=12, column=0, sticky="ew", pady=(8, 0))
         self.convert_btn = ttk.Button(
             actions,
             text="Convert",
@@ -726,6 +746,7 @@ class App:
         self.browse_btn.configure(state=busy)
         self.export_entry.configure(state="normal")
         self.deinterlace_chk.configure(state="normal")
+        self.gpu_decode_chk.configure(state="normal")
         self.jobs_spin.configure(state="readonly")
         ready = bool(self.items) and bool(self.export_var.get().strip()) and self._tools_ready()
         self.convert_btn.configure(text="Convert", state="normal" if ready else "disabled")
@@ -739,6 +760,7 @@ class App:
         self.browse_btn.configure(state=state)
         self.export_entry.configure(state=state)
         self.deinterlace_chk.configure(state=state)
+        self.gpu_decode_chk.configure(state=state)
         self.jobs_spin.configure(state="disabled" if running else "readonly")
         if running:
             self.convert_btn.configure(text="Stop", state="normal")
@@ -829,10 +851,14 @@ class App:
         self._batch_jobs = jobs
         self._batch_t0 = time.monotonic()
         self.progress["value"] = 0
+        self.overall_pct_var.set("0%")
         self.cancel = threading.Event()
         self.running = True
         self._set_running_ui(True)
-        opts = options_for(bool(self.deinterlace_var.get()))
+        opts = options_for(
+            bool(self.deinterlace_var.get()),
+            gpu_decode=bool(self.gpu_decode_var.get()),
+        )
         self.worker = threading.Thread(
             target=run_batch,
             args=(pairs, opts, self.ffmpeg, self.ffprobe, self.events.put, self.cancel),
@@ -1026,12 +1052,15 @@ class App:
         count = len(self.items)
         if count <= 0:
             self.progress["value"] = 0
+            self.overall_pct_var.set("")
             return
         current = 0.0
         for entry in self._active.values():
             if entry.pct is not None:
                 current += entry.fraction
-        self.progress["value"] = (self._finished_files + current) / count * 100.0
+        pct = (self._finished_files + current) / count * 100.0
+        self.progress["value"] = pct
+        self.overall_pct_var.set("{0}%".format(int(round(pct))))
 
     def _failed_names(self) -> list[str]:
         names = []

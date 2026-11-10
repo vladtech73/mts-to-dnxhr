@@ -112,15 +112,17 @@ python mts_to_dnxhr.py ./footage/ --jobs 2
 
 `converted/` is gitignored. Delete it when you are done; it is only a scratch folder.
 
-`--jobs N` encodes up to N clips at once (1-4, default 1). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Parallel encodes do not change the ffmpeg command.
+`--jobs N` encodes up to N clips at once (1-4, default 1). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM.
 
-Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite`, `--output`, `--recursive`, `--jobs`. `--help` lists them.
+`--hwaccel` selects hardware decode (`cuda` by default; also `auto`, `d3d11va`, `qsv`, or `off`). DNxHR encode stays on the CPU. Use `--hwaccel off` to force software decode.
+
+Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite`, `--output`, `--recursive`, `--jobs`, `--hwaccel`. `--help` lists them.
 
 Exit codes: `0` every file converted or skipped, `1` at least one file failed (the batch continues), `2` usage or preflight error (bad path, no clips, FFmpeg missing, two inputs mapping to one output), `130` interrupted. Ctrl+C stops ffmpeg and deletes the partial file.
 
 ## Desktop app (Windows)
 
-The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. Under that checkbox, **Parallel encodes** runs from 1 to 4 clips at once and defaults to 1. A grey hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. **GPU decode (hardware)** is on by default (`-hwaccel cuda`); uncheck it for software decode. **Parallel encodes** runs from 1 to 4 clips at once and defaults to 1. A grey hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
 
 Run it from source, from the repo root:
 

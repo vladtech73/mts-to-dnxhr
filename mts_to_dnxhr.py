@@ -35,6 +35,8 @@ CONTAINERS = {"mov": "mov", "mxf": "mxf"}
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 YADIF = "yadif=mode=send_frame:parity=auto:deint=interlaced"
 MAX_JOBS = 4
+# Decode only. DNxHR encode stays on the CPU. "off" keeps today's software decode.
+HWACCELS = ("off", "auto", "cuda", "d3d11va", "qsv")
 INSTALL_HINT = (
     "error: ffmpeg and ffprobe must be on PATH.\n"
     "Install FFmpeg, then run this command again:\n"
@@ -72,6 +74,7 @@ class Options:
     deinterlace: bool
     overwrite: bool
     duration: Optional[float]
+    hwaccel: str = "cuda"
 
 
 @dataclass(frozen=True)
@@ -313,9 +316,10 @@ def build_command(
         "-loglevel",
         "error",
         "-y" if force else "-n",
-        "-i",
-        str(src.resolve()),
     ]
+    if opts.hwaccel != "off":
+        cmd.extend(["-hwaccel", opts.hwaccel])
+    cmd.extend(["-i", str(src.resolve())])
     if opts.duration is not None:
         cmd.extend(["-t", _duration_arg(opts.duration)])
     cmd.extend(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0"])
@@ -820,6 +824,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Encode only the first N seconds (testing aid)",
     )
     parser.add_argument(
+        "--hwaccel",
+        choices=list(HWACCELS),
+        default="cuda",
+        help=(
+            "Hardware decode before CPU DNxHR encode (default: cuda on NVIDIA). "
+            "Use auto to let FFmpeg pick, or off for software decode"
+        ),
+    )
+    parser.add_argument(
         "-j",
         "--jobs",
         type=_jobs_arg,
@@ -845,6 +858,7 @@ def _print_header(
     print(f"container: {opts.container}")
     print(f"audio: {AUDIO_CODECS[opts.audio_bit_depth]}")
     print(f"output: {out_dir}")
+    print(f"hwaccel: {opts.hwaccel}")
     print(f"jobs: {jobs}")
     suggested = suggested_jobs()
     if jobs > suggested:
@@ -1011,6 +1025,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         deinterlace=args.deinterlace,
         overwrite=args.overwrite,
         duration=args.duration,
+        hwaccel=args.hwaccel,
     )
     ffmpeg = find_tool("ffmpeg")
     ffprobe = find_tool("ffprobe")

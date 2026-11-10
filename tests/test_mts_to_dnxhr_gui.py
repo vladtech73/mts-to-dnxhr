@@ -55,8 +55,10 @@ class DefaultsTests(unittest.TestCase):
             deinterlace=args.deinterlace,
             overwrite=args.overwrite,
             duration=args.duration,
+            hwaccel=args.hwaccel,
         )
         self.assertEqual(gui.DEFAULT_OPTIONS, expected)
+        self.assertEqual(expected.hwaccel, "cuda")
         self.assertEqual(
             gui.OUTPUT_SUMMARY,
             "DNxHR HQX · MOV · PCM 16-bit 48 kHz · source size/fps",
@@ -76,7 +78,10 @@ class DefaultsTests(unittest.TestCase):
             deinterlace=True,
             overwrite=expected.overwrite,
             duration=expected.duration,
+            hwaccel=expected.hwaccel,
         )
+        self.assertEqual(gui.options_for(False, gpu_decode=False).hwaccel, "off")
+        self.assertEqual(gui.options_for(False, gpu_decode=True).hwaccel, "cuda")
         interlaced_cmd = core.build_command(
             "ffmpeg", src, dst, deinterlace, _interlaced(), force=True
         )

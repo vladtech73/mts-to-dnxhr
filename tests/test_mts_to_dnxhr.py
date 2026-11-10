@@ -71,6 +71,7 @@ def _opts(**overrides: object) -> m.Options:
         "deinterlace": False,
         "overwrite": False,
         "duration": None,
+        "hwaccel": "cuda",
     }
     values.update(overrides)
     return m.Options(**values)  # type: ignore[arg-type]
@@ -286,9 +287,23 @@ class CommandTests(unittest.TestCase):
         )
         self.assertNotIn("-progress", cmd)
         self.assertNotIn("-r", cmd)
+        self.assertEqual(cmd[cmd.index("-hwaccel") + 1], "cuda")
+        self.assertLess(cmd.index("-hwaccel"), cmd.index("-i"))
         self.assertEqual(cmd[cmd.index("-i") + 1], str(self.src.resolve()))
         self.assertEqual(cmd[-1], str(self.dst.resolve()))
         self.assertGreater(len(cmd[cmd.index("-i") + 1].split(" ")), 1)
+
+    def test_hwaccel_off_omits_flag_and_auto_is_passed(self) -> None:
+        off = m.build_command(
+            "ffmpeg", self.src, self.dst, _opts(hwaccel="off"), None, False
+        )
+        self.assertNotIn("-hwaccel", off)
+        auto = m.build_command(
+            "ffmpeg", self.src, self.dst, _opts(hwaccel="auto"), None, True
+        )
+        self.assertEqual(auto[auto.index("-hwaccel") + 1], "auto")
+        self.assertLess(auto.index("-y"), auto.index("-hwaccel"))
+        self.assertLess(auto.index("-hwaccel"), auto.index("-i"))
 
     def test_profile_pixel_formats_audio_depth_and_mxf(self) -> None:
         hq = m.build_command(
@@ -366,7 +381,7 @@ class CommandTests(unittest.TestCase):
         forced = m.build_command("ffmpeg", self.src, self.dst, _opts(), None, True)
         self.assertIn("-y", forced)
         self.assertNotIn("-n", forced)
-        self.assertEqual(forced[forced.index("-i") - 1], "-y")
+        self.assertLess(forced.index("-y"), forced.index("-i"))
 
         protected = m.build_command(
             "ffmpeg",
@@ -378,7 +393,7 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("-n", protected)
         self.assertNotIn("-y", protected)
-        self.assertEqual(protected[protected.index("-i") - 1], "-n")
+        self.assertLess(protected.index("-n"), protected.index("-i"))
         self.assertEqual(protected[protected.index("-t") + 1], "3")
 
     def test_windows_quoting_of_optional_map(self) -> None:
@@ -542,6 +557,7 @@ class CliTests(unittest.TestCase):
             "--overwrite",
             "--dry-run",
             "--duration",
+            "--hwaccel",
             "--jobs",
         ):
             self.assertIn(flag, help_text)
@@ -552,6 +568,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(args.audio_bit_depth, 16)
         self.assertFalse(args.deinterlace)
         self.assertFalse(args.overwrite)
+        self.assertEqual(args.hwaccel, "cuda")
         self.assertFalse(args.dry_run)
         self.assertEqual(args.jobs, 1)
 
@@ -568,7 +585,7 @@ class CliTests(unittest.TestCase):
                 code = m.main([str(clip), "--dry-run"])
             text = stdout.getvalue()
             self.assertEqual(code, 0)
-            self.assertIn("-n -i", text)
+            self.assertIn("-n -hwaccel cuda -i", text)
             self.assertIn("dnxhr_hqx", text)
             self.assertIn("yuv422p10le", text)
             self.assertIn("pcm_s16le", text)
@@ -603,8 +620,8 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(protected):
                     code = m.main([str(clip), "-o", str(out_dir), "--dry-run"])
                 self.assertEqual(code, 0)
-                self.assertIn("-n -i", protected.getvalue())
-                self.assertNotIn("-y -i", protected.getvalue())
+                self.assertIn("-n -hwaccel cuda -i", protected.getvalue())
+                self.assertNotIn("-y -hwaccel cuda -i", protected.getvalue())
                 self.assertIn("skip (exists):", protected.getvalue())
 
                 replaced = io.StringIO()
@@ -613,8 +630,8 @@ class CliTests(unittest.TestCase):
                         [str(clip), "-o", str(out_dir), "--dry-run", "--overwrite"]
                     )
                 self.assertEqual(code, 0)
-                self.assertIn("-y -i", replaced.getvalue())
-                self.assertNotIn("-n -i", replaced.getvalue())
+                self.assertIn("-y -hwaccel cuda -i", replaced.getvalue())
+                self.assertNotIn("-n -hwaccel cuda -i", replaced.getvalue())
             self.assertEqual(existing.read_bytes(), b"keep")
 
     def test_missing_path_bad_extension_and_empty_dir_exit_2(self) -> None:
