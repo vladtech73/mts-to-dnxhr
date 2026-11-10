@@ -112,7 +112,7 @@ python mts_to_dnxhr.py ./footage/ --jobs 2
 
 `converted/` is gitignored. Delete it when you are done; it is only a scratch folder.
 
-`--jobs N` encodes up to N clips at once (1-4, default 1). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM.
+`--jobs N` converts up to N streams at once (1-4, default 2). Each job is a full convert (decode + DNxHR encode). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel stream uses about 2 GB of RAM.
 
 `--hwaccel` selects hardware decode (`cuda` by default; also `auto`, `d3d11va`, `qsv`, or `off`). DNxHR encode stays on the CPU. Use `--hwaccel off` to force software decode.
 
@@ -122,7 +122,9 @@ Exit codes: `0` every file converted or skipped, `1` at least one file failed (t
 
 ## Desktop app (Windows)
 
-The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. **GPU decode (hardware)** is on by default (`-hwaccel cuda`); uncheck it for software decode. **Parallel encodes** runs from 1 to 4 clips at once and defaults to 1. A grey hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel encode uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. **GPU decode (hardware)** is on by default (`-hwaccel cuda`); uncheck it for software decode. **Parallel streams** runs from 1 to 4 converts at once and defaults to 2 — each stream already includes decode and encode for that clip. A hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel stream uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+
+Click a column heading to sort by that column, and click it again to reverse the order. Drag a heading divider to resize a column, or double-click a divider to fit the column to its content. Clips convert in the order shown. Size and Modified come from the source file.
 
 Run it from source, from the repo root:
 
@@ -191,7 +193,7 @@ See `samples/README.md`. Media in that folder is gitignored and must not be comm
 ## Limitations
 
 - There is a minimal Windows GUI (DNxHR HQX, MOV, and 16-bit PCM only; use the CLI for other profiles). No installer, code signing, `pyproject.toml`, or bundled FFmpeg.
-- Encodes run in software. Up to 4 clips can encode at once (default 1). There is no GPU encoder.
+- Encodes run in software. Up to 4 streams can convert at once (default 2). There is no GPU encoder.
 - Spanned AVCHD recordings stay as separate files. Each clip converts on its own, so there is a cut at each file boundary. Frames are not dropped. Joining them, reading `.MPL` playlists, and preserving camera timecode are out of scope.
 - No 59.94p (field-rate) deinterlace, scaling, frame-rate conversion, color tagging, or LUTs.
 - Inputs other than `.MTS` and `.M2TS` are rejected.

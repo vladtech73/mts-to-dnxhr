@@ -836,7 +836,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-j",
         "--jobs",
         type=_jobs_arg,
-        default=1,
+        default=2,
         metavar="N",
         help=(
             "Encode up to N clips at once (1-{0}). Suggested for this PC: {1}"

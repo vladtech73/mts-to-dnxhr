@@ -570,7 +570,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(args.overwrite)
         self.assertEqual(args.hwaccel, "cuda")
         self.assertFalse(args.dry_run)
-        self.assertEqual(args.jobs, 1)
+        self.assertEqual(args.jobs, 2)
 
     def test_dry_run_without_ffmpeg_prints_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

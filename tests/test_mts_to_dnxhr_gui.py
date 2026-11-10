@@ -1,4 +1,8 @@
-"""Tests for the GUI wrapper. No Tk window, FFmpeg, or tkinterdnd2 required."""
+"""Tests for the GUI wrapper.
+
+Pure helpers and ``run_batch`` do not need a Tk window. ``AppTableTests``
+creates a hidden Tk root and skips itself when no display is available.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,8 @@ import os
 import struct
 import sys
 import tempfile
+import time
+import tkinter as tk
 import types
 import unittest
 from pathlib import Path
@@ -590,6 +596,326 @@ class IconFileTests(unittest.TestCase):
             self.assertLessEqual(offset + image_size, len(data))
             sizes.add(pixel_w)
         self.assertTrue({16, 24, 32, 48, 256}.issubset(sizes))
+
+
+def _channel(value: float) -> float:
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _contrast_ratio(fg: str, bg: str) -> float:
+    """WCAG 2 relative contrast of two ``#rrggbb`` colors."""
+
+    def luminance(color: str) -> float:
+        text = color.lstrip("#")
+        red = int(text[0:2], 16) / 255.0
+        green = int(text[2:4], 16) / 255.0
+        blue = int(text[4:6], 16) / 255.0
+        return (
+            0.2126 * _channel(red)
+            + 0.7152 * _channel(green)
+            + 0.0722 * _channel(blue)
+        )
+
+    lighter = luminance(fg)
+    darker = luminance(bg)
+    if darker > lighter:
+        lighter, darker = darker, lighter
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _make_row(
+    name: str,
+    seq: int,
+    *,
+    size: object = None,
+    mtime: object = None,
+    status: str = "waiting",
+    parent: object = None,
+) -> gui._Row:
+    folder = Path("C:/clips") if parent is None else Path(str(parent))
+    src = folder / name
+    return gui._Row(
+        item=gui.ClipItem(src=src, root=src),
+        seq=seq,
+        size=size if isinstance(size, int) else None,
+        mtime=mtime if isinstance(mtime, float) else None,
+        status=status,
+        error="",
+    )
+
+
+class SortHelperTests(unittest.TestCase):
+    def test_natural_key_orders_clip_numbers(self) -> None:
+        ordered = sorted(
+            ["clip10.MTS", "Clip2.MTS", "clip1.mts"],
+            key=gui.natural_key,
+        )
+        self.assertEqual(ordered, ["clip1.mts", "Clip2.MTS", "clip10.MTS"])
+
+    def test_natural_key_mixed_digit_and_letter_names(self) -> None:
+        names = ["clip1.mts", "01 American Landscape.MTS", "Clip2.MTS", "00000.MTS"]
+        self.assertEqual(
+            sorted(names, key=gui.natural_key),
+            ["00000.MTS", "01 American Landscape.MTS", "clip1.mts", "Clip2.MTS"],
+        )
+        rows = {
+            name: _make_row(name, seq) for seq, name in enumerate(names, start=1)
+        }
+        descending = [
+            rows[iid].item.src.name for iid in gui.sort_iids(rows, "file", True)
+        ]
+        self.assertEqual(
+            descending,
+            ["Clip2.MTS", "clip1.mts", "01 American Landscape.MTS", "00000.MTS"],
+        )
+
+    def test_format_size_and_mtime(self) -> None:
+        self.assertEqual(gui.format_size(None), "—")
+        self.assertEqual(gui.format_size(0), "0 B")
+        self.assertEqual(gui.format_size(335000000), "335 MB")
+        self.assertEqual(gui.format_size(4700000000), "4.7 GB")
+        self.assertEqual(gui.format_mtime(None), "—")
+        stamp = time.mktime((2020, 6, 15, 9, 5, 0, 0, 0, -1))
+        self.assertEqual(gui.format_mtime(stamp), "2020-06-15 09:05")
+
+    def test_sort_each_column_both_directions(self) -> None:
+        rows = {
+            "a": _make_row("a.mts", 1, size=None, mtime=None),
+            "b": _make_row("b.mts", 2, size=10, mtime=20.0),
+            "c": _make_row("c.mts", 3, size=None, mtime=None),
+            "d": _make_row("d.mts", 4, size=5, mtime=10.0),
+        }
+        self.assertEqual(gui.sort_iids(rows, "size", False), ["d", "b", "a", "c"])
+        self.assertEqual(gui.sort_iids(rows, "size", True), ["b", "d", "a", "c"])
+        self.assertEqual(gui.sort_iids(rows, "mtime", False), ["d", "b", "a", "c"])
+        self.assertEqual(gui.sort_iids(rows, "mtime", True), ["b", "d", "a", "c"])
+        self.assertEqual(gui.sort_iids(rows, "file", False), ["a", "b", "c", "d"])
+        self.assertEqual(gui.sort_iids(rows, "file", True), ["d", "c", "b", "a"])
+        folders = {
+            "wide": _make_row("clip.mts", 1, parent=Path("C:/folder10")),
+            "narrow": _make_row("clip.mts", 2, parent=Path("C:/folder2")),
+        }
+        self.assertEqual(gui.sort_iids(folders, "folder", False), ["narrow", "wide"])
+        self.assertEqual(gui.sort_iids(folders, "folder", True), ["wide", "narrow"])
+
+    def test_ties_keep_add_order_both_ways(self) -> None:
+        rows = {
+            "a": _make_row("Same.MTS", 1, size=5, mtime=1.0, status="waiting"),
+            "b": _make_row("same.mts", 2, size=5, mtime=1.0, status="waiting"),
+            "c": _make_row("SAME.mts", 3, size=5, mtime=1.0, status="waiting"),
+        }
+        for column in ("file", "folder", "size", "mtime", "status"):
+            self.assertEqual(gui.sort_iids(rows, column, False), ["a", "b", "c"])
+            self.assertEqual(gui.sort_iids(rows, column, True), ["a", "b", "c"])
+
+    def test_status_rank_order(self) -> None:
+        specs = (
+            ("w", "waiting"),
+            ("a", "active"),
+            ("o", "ok"),
+            ("s", "skipped"),
+            ("f", "failed"),
+            ("c", "cancelled"),
+        )
+        rows = {
+            iid: _make_row("{0}.mts".format(iid), seq, status=status)
+            for seq, (iid, status) in enumerate(specs, start=1)
+        }
+        self.assertEqual(
+            gui.sort_iids(rows, "status", False),
+            ["a", "w", "f", "c", "s", "o"],
+        )
+        self.assertEqual(
+            gui.sort_iids(rows, "status", True),
+            ["o", "s", "c", "f", "w", "a"],
+        )
+
+
+class PaletteContrastTests(unittest.TestCase):
+    def _assert_contrast(self, fg: str, bg: str, minimum: float) -> None:
+        ratio = _contrast_ratio(fg, bg)
+        self.assertGreaterEqual(
+            ratio,
+            minimum,
+            "{0} on {1} is {2:.2f}, need {3:.1f}".format(fg, bg, ratio, minimum),
+        )
+
+    def test_body_status_accent_and_drop_contrast(self) -> None:
+        palette = gui._Palette
+        for bg in (palette.SURFACE, palette.FIELD):
+            self._assert_contrast(palette.TEXT, bg, 4.5)
+            self._assert_contrast(palette.TEXT_SECONDARY, bg, 4.5)
+        for fg in (palette.OK_FG, palette.FAILED_FG, palette.ACTIVE_FG, palette.MUTED_FG):
+            for bg in (palette.FIELD, palette.STRIPE, palette.SELECT_BG):
+                self._assert_contrast(fg, bg, 4.5)
+        self._assert_contrast(palette.ACCENT_FG, palette.ACCENT, 4.5)
+        self._assert_contrast(palette.ACCENT_FG, palette.ACCENT_ACTIVE, 4.5)
+        self._assert_contrast(palette.ACCENT_DISABLED_FG, palette.ACCENT_DISABLED, 3.0)
+        self._assert_contrast(palette.HEADING_FG, palette.HEADING_BG, 4.5)
+        self._assert_contrast(palette.HEADING_FG, palette.HEADING_ACTIVE, 4.5)
+        self._assert_contrast(palette.ERROR_FG, palette.ERROR_BG, 4.5)
+        for bg in (palette.DROP_BG, palette.DROP_HOT_BG, palette.DROP_PAUSED_BG):
+            self._assert_contrast(palette.TEXT, bg, 4.5)
+        self._assert_contrast(palette.TEXT_DISABLED, palette.SURFACE, 3.0)
+        self._assert_contrast(palette.TEXT, palette.CONTROL_BG, 4.5)
+        self._assert_contrast(palette.TEXT, palette.CONTROL_HOVER, 4.5)
+        self._assert_contrast(palette.SELECT_FG, palette.SELECT_BG, 4.5)
+
+
+class AppTableTests(unittest.TestCase):
+    root: tk.Tk
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            cls.root = tk.Tk()
+        except tk.TclError as exc:
+            raise unittest.SkipTest(
+                "no Tk display available: {0}".format(exc)
+            ) from exc
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        root = getattr(cls, "root", None)
+        if root is not None:
+            root.destroy()
+
+    def setUp(self) -> None:
+        tools = mock.patch(
+            "mts_to_dnxhr_gui.locate_tools",
+            return_value=("ffmpeg", "ffprobe"),
+        )
+        tools.start()
+        self.addCleanup(tools.stop)
+        for name in (
+            "showerror",
+            "showwarning",
+            "showinfo",
+            "askyesno",
+            "askokcancel",
+        ):
+            patcher = mock.patch("mts_to_dnxhr_gui.messagebox.{0}".format(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        folder = Path(self._tmp.name)
+        self.paths = []
+        for name in ("clip10.MTS", "Clip2.MTS", "clip1.mts"):
+            path = folder / name
+            path.write_bytes(b"")
+            self.paths.append(path)
+        self.app = gui.App(self.root, dnd=False)
+        self.app._add_paths(self.paths)
+
+    def tearDown(self) -> None:
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+    def test_file_heading_sorts_and_marks_once(self) -> None:
+        self.app._on_heading_click("file")
+        names = [self.app.tree.set(iid, "file") for iid in self.app.tree.get_children()]
+        self.assertEqual(names, ["clip1.mts", "Clip2.MTS", "clip10.MTS"])
+        self.assertIn("▲", self.app.tree.heading("file", "text"))
+        self.app._on_heading_click("file")
+        names = [self.app.tree.set(iid, "file") for iid in self.app.tree.get_children()]
+        self.assertEqual(names, ["clip10.MTS", "Clip2.MTS", "clip1.mts"])
+        self.assertIn("▼", self.app.tree.heading("file", "text"))
+        marks = 0
+        for col in gui._HEADINGS:
+            text = str(self.app.tree.heading(col, "text"))
+            count = text.count("▲") + text.count("▼")
+            self.assertLessEqual(count, 1)
+            marks += count
+        self.assertEqual(marks, 1)
+
+    def test_status_follows_snapshot_after_resort(self) -> None:
+        self.app._on_heading_click("file")
+        self.app._snapshot_batch_order()
+        batch_iid = self.app._iids[0]
+        batch_name = self.app._rows[batch_iid].item.src.name
+        self.app._on_heading_click("status")
+        self.assertNotEqual(self.app.tree.get_children()[0], batch_iid)
+        self.app._handle_event(("file_started", 0))
+        self.app._handle_event(("file_finished", 0, "failed", "boom"))
+        self.assertEqual(self.app._rows[batch_iid].status, "failed")
+        self.assertEqual(self.app._rows[batch_iid].error, "boom")
+        self.assertTrue(str(self.app.tree.set(batch_iid, "status")).startswith("Failed"))
+        displayed = self.app.tree.get_children()[0]
+        self.assertNotEqual(self.app._rows[displayed].status, "failed")
+        self.assertEqual(self.app._failed_names(), [batch_name])
+
+    def test_remove_selected_on_sorted_view_restripes(self) -> None:
+        self.app._on_heading_click("file")
+        children = list(self.app.tree.get_children())
+        target = children[1]
+        self.app.tree.selection_set(target)
+        self.app.remove_selected()
+        self.assertNotIn(target, self.app._rows)
+        self.assertNotIn(target, self.app._iids)
+        remaining = [
+            self.app.tree.set(iid, "file") for iid in self.app.tree.get_children()
+        ]
+        self.assertEqual(remaining, ["clip1.mts", "clip10.MTS"])
+        for index, iid in enumerate(self.app.tree.get_children()):
+            tags = self.app.tree.item(iid, "tags")
+            stripe = "odd" if index % 2 == 1 else "even"
+            other = "even" if stripe == "odd" else "odd"
+            self.assertIn(stripe, tags)
+            self.assertNotIn(other, tags)
+
+    def test_column_left_of_boundaries_with_default_displaycolumns(self) -> None:
+        shown = self.app.tree["displaycolumns"]
+        self.assertTrue(shown == "#all" or shown == ("#all",))
+        edge = 0
+        for col in self.app.tree["columns"]:
+            edge += int(self.app.tree.column(col, "width"))
+            self.assertEqual(self.app._column_left_of(edge), col)
+
+    def test_row_values_match_insert_columns(self) -> None:
+        for iid in self.app.tree.get_children():
+            row = self.app._rows[iid]
+            self.assertEqual(self.app.tree.set(iid, "status"), "Waiting")
+            self.assertEqual(self.app.tree.set(iid, "folder"), str(row.item.src.parent))
+            self.assertTrue(self.app.tree.set(iid, "size"))
+            self.assertTrue(self.app.tree.set(iid, "mtime"))
+
+    def test_set_status_keeps_odd_stripe(self) -> None:
+        self.app._restripe()
+        odd_index = None
+        for index, iid in enumerate(self.app._iids):
+            if "odd" in self.app.tree.item(iid, "tags"):
+                odd_index = index
+                break
+        self.assertIsNotNone(odd_index)
+        assert odd_index is not None
+        iid = self.app._iids[odd_index]
+        self.app._set_status(odd_index, "active", "Converting…")
+        tags = self.app.tree.item(iid, "tags")
+        self.assertIn("odd", tags)
+        self.assertIn("active", tags)
+
+    def test_default_size_has_no_horizontal_overflow(self) -> None:
+        self.root.update()
+        self.assertEqual(self.app.tree.xview(), (0.0, 1.0))
+
+    def test_autofit_clamps_to_minwidth_and_max(self) -> None:
+        self.app._autofit("file")
+        width = int(self.app.tree.column("file", "width"))
+        self.assertGreaterEqual(width, int(self.app.tree.column("file", "minwidth")))
+        self.assertLessEqual(width, self.app._px(600))
+
+    def test_heading_double_click_does_not_open_error_dialog(self) -> None:
+        iid = self.app.tree.get_children()[0]
+        self.app._rows[iid].status = "failed"
+        self.app._rows[iid].error = "boom"
+        with mock.patch.object(self.app.tree, "identify_region", return_value="heading"):
+            event = mock.Mock(x=5, y=5)
+            self.assertIsNone(self.app._on_double_click(event))
+        gui.messagebox.showerror.assert_not_called()
 
 
 if __name__ == "__main__":
