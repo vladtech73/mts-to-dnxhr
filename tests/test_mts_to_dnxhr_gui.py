@@ -847,6 +847,9 @@ class AppTableTests(unittest.TestCase):
         self.assertEqual(marks, 1)
 
     def test_status_follows_snapshot_after_resort(self) -> None:
+        # Ascending file order matches add seq after alphabetical load; reverse
+        # so the batch snapshot differs from a later equal-status seq sort.
+        self.app._on_heading_click("file")
         self.app._on_heading_click("file")
         self.app._snapshot_batch_order()
         batch_iid = self.app._iids[0]
@@ -896,6 +899,23 @@ class AppTableTests(unittest.TestCase):
             self.assertEqual(self.app.tree.set(iid, "folder"), str(row.item.src.parent))
             self.assertTrue(self.app.tree.set(iid, "size"))
             self.assertTrue(self.app.tree.set(iid, "mtime"))
+
+    def test_add_paths_autofits_file_and_folder(self) -> None:
+        defaults = {name: self.app._px(width) for name, width, *_rest in gui._COLUMN_LAYOUT}
+        deep = Path(self._tmp.name) / ("nested_" + ("folder_" * 12))
+        deep.mkdir(parents=True)
+        long_name = "very_long_clip_name_" + ("x" * 40) + ".MTS"
+        clip = deep / long_name
+        clip.write_bytes(b"")
+        self.app._add_paths([clip])
+        file_width = int(self.app.tree.column("file", "width"))
+        folder_width = int(self.app.tree.column("folder", "width"))
+        self.assertGreater(file_width, defaults["file"])
+        self.assertGreater(folder_width, defaults["folder"])
+        file_needed = self.app._fonts.body.measure(long_name) + self.app._px(16)
+        folder_needed = self.app._fonts.body.measure(str(deep)) + self.app._px(16)
+        self.assertGreaterEqual(file_width, min(file_needed, self.app._px(600)))
+        self.assertGreaterEqual(folder_width, min(folder_needed, self.app._px(600)))
 
     def test_set_status_keeps_odd_stripe(self) -> None:
         self.app._restripe()

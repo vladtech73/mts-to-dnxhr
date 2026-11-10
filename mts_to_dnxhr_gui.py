@@ -1519,6 +1519,8 @@ class App:
             )
             self._iids.append(iid)
         self._apply_sort()
+        self._autofit("file")
+        self._autofit("folder")
         self._update_count()
         message = "Added {0} clips.".format(len(staged))
         if ignored:
