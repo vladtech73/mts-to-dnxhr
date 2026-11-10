@@ -261,7 +261,9 @@ _STATUS_RANK = {
 _STATUS_TAG = {kind: kind for kind in _STATUS_RANK}
 _COLUMN_LAYOUT = (
     ("file", 220, 120, False, "w"),
-    ("status", 230, 140, False, "w"),
+    # Default fits ``100% · 1:02:03``; min fits ``Cancelled``. Long Failed
+    # text can ellipsize until the user double-clicks the divider to autofit.
+    ("status", 100, 72, False, "w"),
     ("size", 90, 70, False, "e"),
     ("mtime", 140, 110, False, "w"),
     ("folder", 290, 160, True, "w"),
@@ -1520,6 +1522,7 @@ class App:
             self._iids.append(iid)
         self._apply_sort()
         self._autofit("file")
+        self._autofit("status")
         self._autofit("folder")
         self._update_count()
         message = "Added {0} clips.".format(len(staged))

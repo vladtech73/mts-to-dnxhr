@@ -910,12 +910,20 @@ class AppTableTests(unittest.TestCase):
         self.app._add_paths([clip])
         file_width = int(self.app.tree.column("file", "width"))
         folder_width = int(self.app.tree.column("folder", "width"))
+        status_width = int(self.app.tree.column("status", "width"))
         self.assertGreater(file_width, defaults["file"])
         self.assertGreater(folder_width, defaults["folder"])
         file_needed = self.app._fonts.body.measure(long_name) + self.app._px(16)
         folder_needed = self.app._fonts.body.measure(str(deep)) + self.app._px(16)
         self.assertGreaterEqual(file_width, min(file_needed, self.app._px(600)))
         self.assertGreaterEqual(folder_width, min(folder_needed, self.app._px(600)))
+        status_min = int(self.app.tree.column("status", "minwidth"))
+        status_needed = max(
+            self.app._fonts.heading.measure("Status"),
+            self.app._fonts.body.measure("Waiting"),
+        ) + self.app._px(16)
+        self.assertEqual(status_width, max(status_min, status_needed))
+        self.assertLessEqual(status_width, defaults["status"])
 
     def test_set_status_keeps_odd_stripe(self) -> None:
         self.app._restripe()
