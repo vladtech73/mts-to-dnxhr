@@ -337,19 +337,13 @@ def natural_key(text: str) -> tuple:
 
 
 def format_size(n: Optional[int]) -> str:
-    """Decimal size (``335 MB``, ``4.7 GB``), or an em dash when unknown."""
+    """Decimal megabytes (``335 MB``, ``4700 MB``), or an em dash when unknown."""
     if n is None:
         return "—"
-    value = float(n if n > 0 else 0)
-    units = ("B", "KB", "MB", "GB", "TB")
-    unit = units[0]
-    for unit in units:
-        if value < 1000.0 or unit == units[-1]:
-            break
-        value /= 1000.0
-    if unit == "B" or abs(value - round(value)) < 1e-6:
-        return "{0:.0f} {1}".format(value, unit)
-    return "{0:.1f} {1}".format(value, unit)
+    mb = float(n if n > 0 else 0) / 1_000_000.0
+    if abs(mb - round(mb)) < 1e-6:
+        return "{0:.0f} MB".format(mb)
+    return "{0:.1f} MB".format(mb)
 
 
 def format_mtime(ts: Optional[float]) -> str:
@@ -1922,10 +1916,10 @@ class App:
             drive = out_dir.drive or str(out_dir.anchor)
             proceed = messagebox.askyesno(
                 "Low disk space",
-                "This batch may need about {0:.1f} GB, but only {1:.1f} GB is free on {2}. "
+                "This batch may need about {0:.0f} MB, but only {1:.0f} MB is free on {2}. "
                 "{3} Convert anyway?".format(
-                    needed / 1e9,
-                    free / 1e9,
+                    needed / 1e6,
+                    free / 1e6,
                     drive,
                     low_space_detail(mode),
                 ),
@@ -2114,7 +2108,9 @@ class App:
                 "cancelled": "Cancelled",
             }.get(status, "Failed (double-click for details)")
             entry = self._active.pop(index, None)
-            if entry is not None and status in ("ok", "failed", "cancelled", "skipped"):
+            # Cancelled rows stay as plain "Cancelled" (no elapsed time), whether
+            # the job was in flight or never started.
+            if entry is not None and status in ("ok", "failed", "skipped"):
                 text = "{0} ({1})".format(text, format_elapsed(time.monotonic() - entry.t0))
             status_kind = {
                 "ok": "ok",

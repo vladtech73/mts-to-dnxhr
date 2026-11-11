@@ -720,9 +720,10 @@ class SortHelperTests(unittest.TestCase):
 
     def test_format_size_and_mtime(self) -> None:
         self.assertEqual(gui.format_size(None), "—")
-        self.assertEqual(gui.format_size(0), "0 B")
+        self.assertEqual(gui.format_size(0), "0 MB")
         self.assertEqual(gui.format_size(335000000), "335 MB")
-        self.assertEqual(gui.format_size(4700000000), "4.7 GB")
+        self.assertEqual(gui.format_size(4700000000), "4700 MB")
+        self.assertEqual(gui.format_size(500000), "0.5 MB")
         self.assertEqual(gui.format_mtime(None), "—")
         stamp = time.mktime((2020, 6, 15, 9, 5, 0, 0, 0, -1))
         self.assertEqual(gui.format_mtime(stamp), "2020-06-15 09:05")
