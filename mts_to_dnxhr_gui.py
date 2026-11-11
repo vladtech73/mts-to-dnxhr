@@ -44,6 +44,8 @@ from tkinter import filedialog, messagebox, ttk
 
 # README: a 168 s HQX encode is about 4.7 GB, roughly 14× a 335 MB source.
 SIZE_RATIO = 14
+# Desktop batches always use two parallel converts (CLI still has --jobs).
+GUI_JOBS = 2
 
 
 class _Palette:
@@ -87,15 +89,22 @@ class _Palette:
 
 
 class _DropdownSelect(tk.Frame):
-    """Flat dropdown for a fixed list of integers (readonly; styled for the night palette)."""
+    """Flat readonly dropdown styled for the night palette.
+
+    ``choices`` are the stored values (ints for jobs, strings for mode). Optional
+    ``labels`` are what the closed control and popup show; defaults to ``str(value)``.
+    """
 
     def __init__(
         self,
         master: tk.Misc,
-        variable: tk.IntVar,
-        choices: Sequence[int],
+        variable: tk.Variable,
+        choices: Sequence[object],
         font: tkfont.Font,
         px: Callable[[int], int],
+        *,
+        labels: Optional[Sequence[str]] = None,
+        width: Optional[int] = None,
     ) -> None:
         super().__init__(
             master,
@@ -108,25 +117,45 @@ class _DropdownSelect(tk.Frame):
         )
         self._var = variable
         self._choices = tuple(choices)
+        if labels is None:
+            self._labels = tuple(str(choice) for choice in self._choices)
+        else:
+            if len(labels) != len(self._choices):
+                raise ValueError("labels must match choices")
+            self._labels = tuple(labels)
+        self._label_for = {
+            choice: label for choice, label in zip(self._choices, self._labels)
+        }
         self._font = font
         self._px = px
         self._enabled = True
         self._popup: Optional[tk.Toplevel] = None
         self._outside_id: Optional[str] = None
-        # Single-digit values: keep the closed control as tight as a spinbox digit.
-        self._label = tk.Label(
-            self,
-            font=font,
-            width=1,
-            anchor="center",
-            bg=_Palette.CONTROL_BG,
-            fg=_Palette.TEXT,
-        )
-        self._label.pack(side="left", padx=(px(3), 0), pady=px(1))
+        # Tk Label ``width`` is in average character cells. Size text labels from
+        # the widest measured string so the closed control stays fixed and the
+        # arrow does not cover the last letter (e.g. HQX).
+        int_choices = all(isinstance(c, int) for c in self._choices)
+        label_kw: dict[str, object] = {
+            "font": font,
+            "anchor": "w" if not int_choices else "center",
+            "bg": _Palette.CONTROL_BG,
+            "fg": _Palette.TEXT,
+        }
+        if width is not None:
+            label_kw["width"] = width
+        elif int_choices:
+            # Single-digit jobs: keep the closed control as tight as a spinbox digit.
+            label_kw["width"] = 1
+        else:
+            max_px = max((font.measure(label) for label in self._labels), default=0)
+            cell = max(font.measure("0"), 1)
+            label_kw["width"] = max(1, (max_px + cell - 1) // cell)
+        self._label = tk.Label(self, **label_kw)
+        self._label.pack(side="left", padx=(px(6), px(8)), pady=px(2))
         self._arrow = tk.Label(
             self, text="▾", font=font, bg=_Palette.CONTROL_BG, fg=_Palette.TEXT_SECONDARY
         )
-        self._arrow.pack(side="left", padx=(0, px(2)))
+        self._arrow.pack(side="left", padx=(0, px(6)))
         for widget in (self, self._label, self._arrow):
             widget.bind("<Button-1>", self._on_click)
             widget.bind("<Enter>", lambda _e: self._paint(hover=True))
@@ -137,15 +166,15 @@ class _DropdownSelect(tk.Frame):
         self._var.trace_add("write", lambda *_a: self._refresh())
         self._refresh()
 
-    def _value(self) -> int:
+    def _value(self) -> object:
         try:
-            value = int(self._var.get())
-        except (tk.TclError, ValueError):
+            value = self._var.get()
+        except tk.TclError:
             return self._choices[0]
         return value if value in self._choices else self._choices[0]
 
     def _refresh(self) -> None:
-        self._label.configure(text=str(self._value()))
+        self._label.configure(text=self._label_for[self._value()])
 
     def _paint(self, hover: bool) -> None:
         if not self._enabled:
@@ -181,17 +210,17 @@ class _DropdownSelect(tk.Frame):
         body = tk.Frame(popup, bg=_Palette.CONTROL_BG)
         body.pack(padx=1, pady=1)
         current = self._value()
-        for n in self._choices:
-            selected = n == current
+        for choice, label in zip(self._choices, self._labels):
+            selected = choice == current
             row = tk.Label(
                 body,
-                text=str(n),
+                text=label,
                 font=self._font,
-                anchor="center",
+                anchor="w",
                 bg=_Palette.SELECT_BG if selected else _Palette.CONTROL_BG,
                 fg=_Palette.SELECT_FG if selected else _Palette.TEXT,
-                padx=self._px(8),
-                pady=self._px(2),
+                padx=self._px(10),
+                pady=self._px(4),
             )
             row.pack(fill="x")
             row.bind(
@@ -205,7 +234,7 @@ class _DropdownSelect(tk.Frame):
                     fg=_Palette.SELECT_FG if sel else _Palette.TEXT,
                 ),
             )
-            row.bind("<Button-1>", lambda _e, v=n: self._choose(v))
+            row.bind("<Button-1>", lambda _e, v=choice: self._choose(v))
         popup.bind("<Escape>", lambda _e: self._close())
         self.update_idletasks()
         popup.update_idletasks()
@@ -225,7 +254,7 @@ class _DropdownSelect(tk.Frame):
             return
         self._close()
 
-    def _choose(self, value: int) -> None:
+    def _choose(self, value: object) -> None:
         self._var.set(value)
         self._close()
 
@@ -1190,8 +1219,8 @@ class App:
                 min(self._px(700), root.winfo_screenheight() - self._px(80)),
             )
         )
-        # 800×620 is the smallest 100% size that keeps the mode row, the options
-        # row, and the FFmpeg banner intact, with two clip rows still visible.
+        # 800×620 is the smallest 100% size that keeps the options row and the
+        # FFmpeg banner intact, with two clip rows still visible.
         min_w = min(self._px(800), root.winfo_screenwidth() - self._px(40))
         min_h = min(self._px(620), root.winfo_screenheight() - self._px(80))
         self.root.minsize(min_w, min_h)
@@ -1347,44 +1376,20 @@ class App:
         self.browse_btn.grid(row=0, column=2, padx=(self._px(6), 0))
         self.export_var.trace_add("write", self._on_export_changed)
 
-        mode_row = ttk.Frame(settings)
-        mode_row.grid(row=1, column=0, sticky="ew", pady=(0, gap))
-        ttk.Label(mode_row, text="Mode:").pack(side="left")
-        self.mode_var = tk.StringVar(value="dnxhr")
-        self.mode_dnxhr = ttk.Radiobutton(
-            mode_row,
-            text="DNxHR HQX",
-            value="dnxhr",
-            variable=self.mode_var,
-        )
-        self.mode_remux = ttk.Radiobutton(
-            mode_row,
-            text="Remux MP4",
-            value="remux",
-            variable=self.mode_var,
-        )
-        self.mode_dnxhr.pack(side="left", padx=(self._px(8), self._px(12)))
-        self.mode_remux.pack(side="left")
-        self.mode_var.trace_add("write", self._on_mode_changed)
-
         options = ttk.Frame(settings)
-        options.grid(row=2, column=0, sticky="ew")
-        # Concurrent convert jobs (each job already includes decode + DNxHR encode).
-        ttk.Label(options, text="Parallel streams:").pack(side="left")
-        self.jobs_var = tk.IntVar(value=2)
-        self.jobs_combo = _DropdownSelect(
+        options.grid(row=1, column=0, sticky="ew")
+        ttk.Label(options, text="Mode:").pack(side="left")
+        self.mode_var = tk.StringVar(value="dnxhr")
+        self.mode_combo = _DropdownSelect(
             options,
-            self.jobs_var,
-            range(1, core.MAX_JOBS + 1),
+            self.mode_var,
+            ("dnxhr", "remux"),
             self._fonts.body,
             self._px,
+            labels=("DNxHR HQX", "Remux MP4"),
         )
-        self.jobs_combo.pack(side="left", padx=(self._px(6), self._px(6)))
-        ttk.Label(
-            options,
-            text="(suggested max {0} for this PC)".format(core.suggested_jobs()),
-            style="Secondary.TLabel",
-        ).pack(side="left", padx=(0, self._px(12)))
+        self.mode_combo.pack(side="left", padx=(self._px(6), self._px(12)))
+        self.mode_var.trace_add("write", self._on_mode_changed)
         self.gpu_decode_var = tk.BooleanVar(value=DEFAULT_OPTIONS.hwaccel != "off")
         self.gpu_decode_chk = ttk.Checkbutton(
             options,
@@ -1748,9 +1753,7 @@ class App:
         option_state = "disabled" if self.mode_var.get() == "remux" else "normal"
         self.deinterlace_chk.configure(state=option_state)
         self.gpu_decode_chk.configure(state=option_state)
-        self.mode_dnxhr.configure(state="normal")
-        self.mode_remux.configure(state="normal")
-        self.jobs_combo.set_enabled(True)
+        self.mode_combo.set_enabled(True)
         ready = bool(self._rows) and bool(self.export_var.get().strip()) and self._tools_ready()
         self.convert_btn.configure(text="Convert", state="normal" if ready else "disabled")
 
@@ -1763,10 +1766,8 @@ class App:
         self.browse_btn.configure(state=state)
         self.export_entry.configure(state=state)
         self.deinterlace_chk.configure(state=state)
-        self.mode_dnxhr.configure(state=state)
-        self.mode_remux.configure(state=state)
         self.gpu_decode_chk.configure(state=state)
-        self.jobs_combo.set_enabled(not running)
+        self.mode_combo.set_enabled(not running)
         if running:
             self.convert_btn.configure(text="Stop", state="normal")
         else:
@@ -1945,10 +1946,7 @@ class App:
         for index, iid in enumerate(self._iids):
             self._rows[iid].error = ""
             self._set_status(index, "waiting", "Waiting")
-        try:
-            jobs = max(1, min(core.MAX_JOBS, int(self.jobs_var.get())))
-        except (tk.TclError, ValueError):
-            jobs = 1
+        jobs = GUI_JOBS
         self._finished_files = 0
         self._active = {}
         self._batch_jobs = jobs
