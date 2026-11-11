@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Optional
@@ -70,6 +71,7 @@ def _opts(**overrides: object) -> m.Options:
         "deinterlace": False,
         "overwrite": False,
         "duration": None,
+        "hwaccel": "cuda",
     }
     values.update(overrides)
     return m.Options(**values)  # type: ignore[arg-type]
@@ -163,11 +165,14 @@ class DiscoveryTests(unittest.TestCase):
             self.root / "dnxhr" / "A.mxf",
         )
         self.assertEqual(m.default_output_dir(clip), self.root / "dnxhr")
+        self.assertEqual(m.default_output_dir(clip, "dnxhr_hq"), self.root / "dnxhr")
+        self.assertEqual(m.default_output_dir(clip, "remux"), self.root / "remux")
 
         footage = self.root / "footage"
         footage.mkdir()
         slashed = Path(str(footage) + os.sep)
         self.assertEqual(m.default_output_dir(slashed), self.root / "footage_dnxhr")
+        self.assertEqual(m.default_output_dir(slashed, "remux"), self.root / "footage_remux")
 
     def test_collisions_are_case_insensitive_on_windows(self) -> None:
         out = self.root / "out"
@@ -285,9 +290,102 @@ class CommandTests(unittest.TestCase):
         )
         self.assertNotIn("-progress", cmd)
         self.assertNotIn("-r", cmd)
+        self.assertEqual(cmd[cmd.index("-hwaccel") + 1], "cuda")
+        self.assertLess(cmd.index("-hwaccel"), cmd.index("-i"))
         self.assertEqual(cmd[cmd.index("-i") + 1], str(self.src.resolve()))
         self.assertEqual(cmd[-1], str(self.dst.resolve()))
         self.assertGreater(len(cmd[cmd.index("-i") + 1].split(" ")), 1)
+
+    def test_remux_copies_video_and_encodes_aac(self) -> None:
+        cmd = m.build_command(
+            "ffmpeg",
+            self.src,
+            self.dst.with_suffix(".mp4"),
+            _opts(profile="remux", container="mp4"),
+            _interlaced(),
+            False,
+        )
+        _assert_sequence(self, cmd, ["-fflags", "+genpts"])
+        _assert_sequence(
+            self,
+            cmd,
+            [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+            ],
+        )
+        self.assertLess(cmd.index("-fflags"), cmd.index("-i"))
+        self.assertLess(cmd.index("-i"), cmd.index("-c:v"))
+        self.assertNotIn("-hwaccel", cmd)
+        joined = " ".join(cmd)
+        self.assertNotIn("dnx", joined)
+        self.assertNotIn("pcm", joined)
+        self.assertNotIn("yadif", joined)
+        self.assertNotIn("-vf", cmd)
+        self.assertNotIn("-pix_fmt", cmd)
+        self.assertNotIn("-field_order", cmd)
+        self.assertNotIn("-profile:v", cmd)
+
+        off = m.build_command(
+            "ffmpeg",
+            self.src,
+            self.dst.with_suffix(".mp4"),
+            _opts(
+                profile="remux",
+                container="mp4",
+                hwaccel="off",
+                deinterlace=True,
+                duration=3,
+            ),
+            _interlaced(),
+            True,
+        )
+        self.assertNotIn("-hwaccel", off)
+        self.assertIn("-y", off)
+        self.assertEqual(off[off.index("-t") + 1], "3")
+        self.assertNotIn("yadif", off)
+        self.assertIn("+genpts", off)
+        self.assertEqual(off[off.index("-c:v") + 1], "copy")
+
+    def test_options_require_remux_mp4_pairing(self) -> None:
+        m.Options(
+            profile="remux",
+            container="mp4",
+            audio_bit_depth=16,
+            deinterlace=False,
+            overwrite=False,
+            duration=None,
+        )
+        _opts(profile="dnxhr_hq", container="mxf")
+        for kwargs in (
+            {"profile": "remux", "container": "mov"},
+            {"profile": "remux", "container": "mxf"},
+            {"profile": "dnxhr_hqx", "container": "mp4"},
+        ):
+            with self.assertRaises(ValueError):
+                _opts(**kwargs)
+
+    def test_hwaccel_off_omits_flag_and_auto_is_passed(self) -> None:
+        off = m.build_command(
+            "ffmpeg", self.src, self.dst, _opts(hwaccel="off"), None, False
+        )
+        self.assertNotIn("-hwaccel", off)
+        auto = m.build_command(
+            "ffmpeg", self.src, self.dst, _opts(hwaccel="auto"), None, True
+        )
+        self.assertEqual(auto[auto.index("-hwaccel") + 1], "auto")
+        self.assertLess(auto.index("-y"), auto.index("-hwaccel"))
+        self.assertLess(auto.index("-hwaccel"), auto.index("-i"))
 
     def test_profile_pixel_formats_audio_depth_and_mxf(self) -> None:
         hq = m.build_command(
@@ -365,7 +463,7 @@ class CommandTests(unittest.TestCase):
         forced = m.build_command("ffmpeg", self.src, self.dst, _opts(), None, True)
         self.assertIn("-y", forced)
         self.assertNotIn("-n", forced)
-        self.assertEqual(forced[forced.index("-i") - 1], "-y")
+        self.assertLess(forced.index("-y"), forced.index("-i"))
 
         protected = m.build_command(
             "ffmpeg",
@@ -377,7 +475,7 @@ class CommandTests(unittest.TestCase):
         )
         self.assertIn("-n", protected)
         self.assertNotIn("-y", protected)
-        self.assertEqual(protected[protected.index("-i") - 1], "-n")
+        self.assertLess(protected.index("-n"), protected.index("-i"))
         self.assertEqual(protected[protected.index("-t") + 1], "3")
 
     def test_windows_quoting_of_optional_map(self) -> None:
@@ -385,6 +483,146 @@ class CommandTests(unittest.TestCase):
             self.skipTest("Windows quoting")
         text = m.format_command(["ffmpeg", "-map", "0:a?", "-i", r"C:\Clips\a.MTS"])
         self.assertIn('"0:a?"', text)
+
+
+class JobsTests(unittest.TestCase):
+    def test_suggested_jobs_table(self) -> None:
+        expected = {
+            0: 1,
+            4: 1,
+            8: 1,
+            11: 1,
+            12: 2,
+            16: 2,
+            18: 2,
+            20: 2,
+            128: 2,
+        }
+        for cpu_count, jobs in expected.items():
+            self.assertEqual(m.suggested_jobs(cpu_count), jobs)
+            self.assertLessEqual(jobs, m.MAX_JOBS)
+
+    def test_suggested_jobs_reads_cpu_count_when_omitted(self) -> None:
+        with mock.patch("mts_to_dnxhr.os.cpu_count", return_value=None):
+            self.assertEqual(m.suggested_jobs(), 1)
+            self.assertEqual(m.suggested_jobs(None), 1)
+        with mock.patch("mts_to_dnxhr.os.cpu_count", return_value=20):
+            self.assertEqual(m.suggested_jobs(), 2)
+            self.assertEqual(m.suggested_jobs(None), 2)
+
+    def test_run_indexed_bounds_in_flight_and_covers_every_index(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        in_flight = 0
+        max_in_flight = 0
+        seen: list[int] = []
+
+        def work(index: int) -> None:
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                if in_flight > max_in_flight:
+                    max_in_flight = in_flight
+                seen.append(index)
+            time.sleep(0.02)
+            with lock:
+                in_flight -= 1
+
+        m.run_indexed(8, 3, work, cancel)
+        self.assertEqual(max_in_flight, 3)
+        self.assertEqual(sorted(seen), list(range(8)))
+
+    def test_run_indexed_overlaps(self) -> None:
+        barrier = threading.Barrier(2, timeout=5)
+        cancel = threading.Event()
+
+        def work(_index: int) -> None:
+            barrier.wait()
+
+        m.run_indexed(2, 2, work, cancel)
+
+    def test_jobs_above_cap_are_clamped(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        in_flight = 0
+        max_in_flight = 0
+
+        def work(_index: int) -> None:
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                if in_flight > max_in_flight:
+                    max_in_flight = in_flight
+            time.sleep(0.02)
+            with lock:
+                in_flight -= 1
+
+        m.run_indexed(8, 99, work, cancel)
+        self.assertLessEqual(max_in_flight, m.MAX_JOBS)
+
+    def test_jobs_one_runs_inline_in_order(self) -> None:
+        caller = threading.current_thread()
+        order: list[int] = []
+        cancel = threading.Event()
+
+        def work(index: int) -> None:
+            self.assertIs(threading.current_thread(), caller)
+            order.append(index)
+
+        self.assertEqual(m.run_indexed(0, 2, work, cancel), [])
+        m.run_indexed(4, 1, work, cancel)
+        self.assertEqual(order, [0, 1, 2, 3])
+
+    def test_cancel_during_work_jobs_one_returns_the_rest(self) -> None:
+        cancel = threading.Event()
+        ran: list[int] = []
+
+        def work(index: int) -> None:
+            ran.append(index)
+            if index == 1:
+                cancel.set()
+
+        unstarted = m.run_indexed(5, 1, work, cancel)
+        self.assertEqual(ran, [0, 1])
+        self.assertEqual(unstarted, [2, 3, 4])
+
+    def test_cancel_during_work_jobs_two_partitions_indices(self) -> None:
+        cancel = threading.Event()
+        lock = threading.Lock()
+        ran: list[int] = []
+
+        def work(index: int) -> None:
+            with lock:
+                ran.append(index)
+            if index == 1:
+                cancel.set()
+
+        count = 6
+        unstarted = m.run_indexed(count, 2, work, cancel)
+        self.assertEqual(sorted(ran + unstarted), list(range(count)))
+        self.assertEqual(len(set(ran) & set(unstarted)), 0)
+
+    def test_cancel_already_set_runs_nothing(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        calls: list[int] = []
+
+        def work(index: int) -> None:
+            calls.append(index)
+
+        self.assertEqual(m.run_indexed(4, 2, work, cancel), [0, 1, 2, 3])
+        self.assertEqual(calls, [])
+
+    def test_exception_is_reraised_and_sets_cancel(self) -> None:
+        cancel = threading.Event()
+
+        def work(index: int) -> None:
+            if index == 0:
+                raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            m.run_indexed(3, 2, work, cancel)
+        self.assertTrue(cancel.is_set())
 
 
 class CliTests(unittest.TestCase):
@@ -401,16 +639,25 @@ class CliTests(unittest.TestCase):
             "--overwrite",
             "--dry-run",
             "--duration",
+            "--hwaccel",
+            "--jobs",
         ):
             self.assertIn(flag, help_text)
         self.assertIn("testing aid", help_text)
+        self.assertIn("remux", help_text)
+        self.assertIn("does not decode audio", help_text)
+        self.assertNotIn("affects audio decode", help_text)
         args = parser.parse_args(["clip.MTS"])
         self.assertEqual(args.profile, "dnxhr_hqx")
         self.assertEqual(args.container, "mov")
+        self.assertFalse(args.container_set)
         self.assertEqual(args.audio_bit_depth, 16)
+        self.assertFalse(args.audio_bit_depth_set)
         self.assertFalse(args.deinterlace)
         self.assertFalse(args.overwrite)
+        self.assertEqual(args.hwaccel, "cuda")
         self.assertFalse(args.dry_run)
+        self.assertEqual(args.jobs, 2)
 
     def test_dry_run_without_ffmpeg_prints_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,11 +672,94 @@ class CliTests(unittest.TestCase):
                 code = m.main([str(clip), "--dry-run"])
             text = stdout.getvalue()
             self.assertEqual(code, 0)
-            self.assertIn("-n -i", text)
+            self.assertIn("-n -hwaccel cuda -i", text)
             self.assertIn("dnxhr_hqx", text)
             self.assertIn("yuv422p10le", text)
             self.assertIn("pcm_s16le", text)
             self.assertFalse((root / "dnxhr").exists())
+
+    def test_remux_dry_run_copies_video_to_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            clip = root / "clip.MTS"
+            clip.write_bytes(b"")
+            stdout = io.StringIO()
+            with mock.patch("mts_to_dnxhr.find_tool", return_value=None), contextlib.redirect_stdout(
+                stdout
+            ):
+                code = m.main([str(clip), "--profile", "remux", "--dry-run"])
+            text = stdout.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn("profile: remux", text)
+            self.assertIn("container: mp4", text)
+            self.assertIn("audio: aac", text)
+            self.assertIn("hwaccel: unused", text)
+            self.assertNotIn("-hwaccel", text)
+            self.assertIn("-fflags +genpts", text)
+            self.assertIn("-c:v copy", text)
+            self.assertIn("-c:a aac", text)
+            self.assertIn("-b:a 192k", text)
+            self.assertIn("-ar 48000", text)
+            self.assertIn("-movflags +faststart", text)
+            self.assertIn("-f mp4", text)
+            self.assertIn(str((root / "remux" / "clip.mp4").resolve()), text)
+            self.assertNotIn("dnxhr", text)
+            self.assertNotIn("pcm_", text)
+            self.assertNotIn("yadif", text)
+            self.assertFalse((root / "remux").exists())
+
+            footage = root / "footage"
+            footage.mkdir()
+            nested = footage / "clip.MTS"
+            nested.write_bytes(b"")
+            folder_out = io.StringIO()
+            with mock.patch("mts_to_dnxhr.find_tool", return_value=None), contextlib.redirect_stdout(
+                folder_out
+            ):
+                code = m.main([str(footage), "--profile", "remux", "--container", "mp4", "--dry-run"])
+            folder_text = folder_out.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn(str((root / "footage_remux" / "clip.mp4").resolve()), folder_text)
+            self.assertNotIn("dnxhr", folder_text)
+
+    def test_remux_rejects_other_container_pcm_depth_and_deinterlace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp).resolve() / "clip.MTS"
+            clip.write_bytes(b"")
+            cases = (
+                (["--container", "mov"], "mp4"),
+                (["--container", "mxf"], "mp4"),
+                (["--deinterlace"], "deinterlace"),
+                (["--audio-bit-depth", "16"], "audio-bit-depth"),
+                (["--audio-bit-depth", "24"], "audio-bit-depth"),
+            )
+            for extra, needle in cases:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code = m.main([str(clip), "--profile", "remux", "--dry-run", *extra])
+                self.assertEqual(code, 2, extra)
+                self.assertIn(needle, stderr.getvalue())
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = m.main([str(clip), "--container", "mp4", "--dry-run"])
+            self.assertEqual(code, 2)
+            self.assertIn("mp4", stderr.getvalue())
+            self.assertIn("remux", stderr.getvalue())
+
+    def test_header_prints_jobs_and_above_suggestion_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp).resolve() / "clip.MTS"
+            clip.write_bytes(b"")
+            for jobs, suggested, expect_note in ((1, 1, False), (2, 1, True), (2, 2, False)):
+                stdout = io.StringIO()
+                with mock.patch("mts_to_dnxhr.find_tool", return_value=None), mock.patch(
+                    "mts_to_dnxhr.suggested_jobs", return_value=suggested
+                ), contextlib.redirect_stdout(stdout):
+                    code = m.main([str(clip), "--dry-run", "--jobs", str(jobs)])
+                text = stdout.getvalue()
+                self.assertEqual(code, 0)
+                self.assertIn(f"jobs: {jobs}", text)
+                self.assertEqual("note: --jobs" in text, expect_note)
 
     def test_dry_run_overwrite_flag_matches_existing_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -445,8 +775,8 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(protected):
                     code = m.main([str(clip), "-o", str(out_dir), "--dry-run"])
                 self.assertEqual(code, 0)
-                self.assertIn("-n -i", protected.getvalue())
-                self.assertNotIn("-y -i", protected.getvalue())
+                self.assertIn("-n -hwaccel cuda -i", protected.getvalue())
+                self.assertNotIn("-y -hwaccel cuda -i", protected.getvalue())
                 self.assertIn("skip (exists):", protected.getvalue())
 
                 replaced = io.StringIO()
@@ -455,8 +785,8 @@ class CliTests(unittest.TestCase):
                         [str(clip), "-o", str(out_dir), "--dry-run", "--overwrite"]
                     )
                 self.assertEqual(code, 0)
-                self.assertIn("-y -i", replaced.getvalue())
-                self.assertNotIn("-n -i", replaced.getvalue())
+                self.assertIn("-y -hwaccel cuda -i", replaced.getvalue())
+                self.assertNotIn("-n -hwaccel cuda -i", replaced.getvalue())
             self.assertEqual(existing.read_bytes(), b"keep")
 
     def test_missing_path_bad_extension_and_empty_dir_exit_2(self) -> None:
@@ -516,6 +846,56 @@ class CliTests(unittest.TestCase):
             self.assertEqual(err, "Invalid data found when processing input")
             self.assertFalse(dst.parent.exists())
 
+    def test_shared_parent_survives_sibling_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            src_a = root / "a.MTS"
+            src_b = root / "b.MTS"
+            src_a.write_bytes(b"")
+            src_b.write_bytes(b"")
+            dst_a = root / "out" / "a.mov"
+            dst_b = root / "out" / "b.mov"
+            b_in_probe = threading.Event()
+            release_b = threading.Event()
+
+            def fake_probe(src: Path, _ffprobe: str) -> m.ProbeInfo:
+                if src.name == "b.MTS":
+                    b_in_probe.set()
+                    if not release_b.wait(timeout=5):
+                        raise m.ProbeError("timed out waiting to release b")
+                    raise m.ProbeError("b failed")
+                if not b_in_probe.wait(timeout=5):
+                    raise m.ProbeError("timed out waiting for b")
+                raise m.ProbeError("a failed")
+
+            results: dict[str, tuple[str, str]] = {}
+
+            def run(name: str, src: Path, dst: Path) -> None:
+                results[name] = m.convert_one(
+                    src,
+                    dst,
+                    _opts(),
+                    "ffmpeg",
+                    "ffprobe",
+                    log=lambda _line: None,
+                )
+
+            with mock.patch("mts_to_dnxhr.probe", side_effect=fake_probe):
+                thread_a = threading.Thread(target=run, args=("a", src_a, dst_a))
+                thread_b = threading.Thread(target=run, args=("b", src_b, dst_b))
+                thread_a.start()
+                thread_b.start()
+                thread_a.join(timeout=5)
+                self.assertFalse(thread_a.is_alive())
+                self.assertEqual(results["a"][0], "failed")
+                self.assertTrue(dst_a.parent.exists())
+                release_b.set()
+                thread_b.join(timeout=5)
+                self.assertFalse(thread_b.is_alive())
+                self.assertEqual(results["b"][0], "failed")
+                self.assertFalse(dst_b.parent.exists())
+                self.assertEqual(m._dir_users, {})
+
     def test_collision_exits_2(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -526,6 +906,88 @@ class CliTests(unittest.TestCase):
                 code = m.main([str(root), "--dry-run"])
             self.assertEqual(code, 2)
             self.assertIn("collision", stderr.getvalue())
+
+    def test_jobs_outside_range_exit_2(self) -> None:
+        parser = m.build_parser()
+        for bad in ("0", "5", "x"):
+            with self.assertRaises(SystemExit) as caught:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    parser.parse_args(["clip.MTS", "--jobs", bad])
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_encode_all_jobs_two_ok_failed_and_cancelled(self) -> None:
+        pairs = [(Path("a.MTS"), Path("a.mov")), (Path("b.MTS"), Path("b.mov"))]
+        opts = _opts()
+
+        def check_parallel(*_args: object, **kwargs: object) -> None:
+            self.assertIsNotNone(kwargs.get("on_progress"))
+            self.assertIsNotNone(kwargs.get("cancel"))
+
+        barrier = threading.Barrier(2, timeout=5)
+
+        def ok_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            barrier.wait()
+            return "ok", ""
+
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=ok_convert):
+            code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        self.assertEqual(code, 0)
+
+        fail_barrier = threading.Barrier(2, timeout=5)
+
+        def fail_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            fail_barrier.wait()
+            src = args[0]
+            assert isinstance(src, Path)
+            if src.name == "b.MTS":
+                return "failed", "nope"
+            return "ok", ""
+
+        stdout = io.StringIO()
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=fail_convert):
+            with contextlib.redirect_stdout(stdout):
+                code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        text = stdout.getvalue()
+        self.assertEqual(code, 1)
+        summary_at = text.find("converted 1, skipped 0, failed 1")
+        failed_at = text.find("failed: b.MTS")
+        self.assertGreater(summary_at, -1)
+        self.assertGreater(failed_at, summary_at)
+        self.assertIn("nope", text[failed_at:])
+
+        def cancel_convert(*args: object, **kwargs: object) -> tuple[str, str]:
+            check_parallel(*args, **kwargs)
+            src = args[0]
+            assert isinstance(src, Path)
+            if src.name == "b.MTS":
+                raise m.ConversionCancelled()
+            return "ok", ""
+
+        stdout = io.StringIO()
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=cancel_convert):
+            with contextlib.redirect_stdout(stdout):
+                code = m._encode_all(pairs, opts, "ffmpeg", "ffprobe", jobs=2)
+        self.assertEqual(code, 0)
+        self.assertIn("converted 1, skipped 0, failed 0", stdout.getvalue())
+        self.assertNotIn("failed: b.MTS", stdout.getvalue())
+
+    def test_jobs_one_omits_on_progress(self) -> None:
+        def fake_convert(*_args: object, **kwargs: object) -> tuple[str, str]:
+            self.assertIsNone(kwargs.get("on_progress"))
+            return "ok", ""
+
+        with mock.patch("mts_to_dnxhr.convert_one", side_effect=fake_convert) as convert:
+            code = m._encode_all(
+                [(Path("a.MTS"), Path("a.mov"))],
+                _opts(),
+                "ffmpeg",
+                "ffprobe",
+                jobs=1,
+            )
+        self.assertEqual(code, 0)
+        self.assertIsNone(convert.call_args.kwargs.get("on_progress"))
 
 
 class _FakeFfmpeg:

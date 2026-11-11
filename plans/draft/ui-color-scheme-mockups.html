@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MTS to DNxHR — color scheme mockups</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 14px/1.4 "Segoe UI", system-ui, sans-serif;
+      background: #d8d8d8;
+      color: #1a1a1a;
+      padding: 24px;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 8px; }
+    .intro { margin: 0 0 24px; max-width: 72rem; color: #333; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 20px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 1px 3px rgba(0,0,0,.12);
+    }
+    .card header {
+      padding: 10px 12px;
+      border-bottom: 1px solid #ccc;
+      background: #f7f7f7;
+    }
+    .card header strong { display: block; font-size: 1rem; }
+    .card header span { color: #555; font-size: 0.85rem; }
+    .swatches { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; border-bottom: 1px solid #eee; }
+    .swatch {
+      width: 28px; height: 28px; border-radius: 4px;
+      border: 1px solid rgba(0,0,0,.2);
+      title: "";
+    }
+    .mock {
+      padding: 12px;
+      font-size: 12px;
+    }
+    .win {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .titlebar {
+      background: var(--heading);
+      color: var(--heading-fg);
+      padding: 6px 10px;
+      font-weight: 600;
+      border-bottom: 1px solid var(--border);
+    }
+    .drop {
+      margin: 10px;
+      padding: 14px 10px;
+      text-align: center;
+      background: var(--drop);
+      border: 2px solid var(--drop-border);
+      border-radius: 2px;
+    }
+    .drop.hot {
+      background: var(--drop-hot);
+      border-color: var(--drop-hot-border);
+      margin-top: 6px;
+    }
+    .drop .sub { color: var(--secondary); font-size: 11px; margin-top: 4px; }
+    .btn-row { display: flex; gap: 6px; justify-content: center; margin-top: 8px; }
+    .btn {
+      background: var(--field);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 3px 8px;
+      border-radius: 2px;
+      font: inherit;
+    }
+    .btn.accent {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-fg);
+      font-weight: 600;
+    }
+    .btn:disabled, .btn.disabled {
+      background: var(--disabled);
+      color: var(--text-disabled);
+      border-color: var(--disabled);
+    }
+    .toolbar {
+      display: flex; justify-content: space-between; align-items: center;
+      margin: 0 10px 6px; font-weight: 600;
+    }
+    table {
+      width: calc(100% - 20px);
+      margin: 0 10px 10px;
+      border-collapse: collapse;
+      background: var(--field);
+      border: 1px solid var(--border);
+    }
+    th {
+      background: var(--heading);
+      color: var(--heading-fg);
+      text-align: left;
+      padding: 5px 8px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+    }
+    td { padding: 5px 8px; border-bottom: 1px solid #eee; }
+    tr.stripe td { background: var(--stripe); }
+    tr.sel td { background: var(--select); }
+    .st-wait { color: var(--muted); }
+    .st-active { color: var(--active); font-weight: 600; }
+    .st-ok { color: var(--ok); }
+    .st-fail { color: var(--failed); }
+    .settings {
+      margin: 0 10px 10px;
+      padding: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .settings legend {
+      padding: 0 4px;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+    .check {
+      width: 14px; height: 14px; border: 2px solid var(--border);
+      background: var(--field); display: inline-flex; align-items: center; justify-content: center;
+      color: var(--accent); font-size: 11px; font-weight: 700; line-height: 1;
+    }
+    .check.on { border-color: var(--accent); }
+    .field {
+      flex: 1; min-width: 80px; background: var(--field);
+      border: 1px solid var(--border); padding: 3px 6px; color: var(--text);
+    }
+    .banner {
+      margin: 0 10px 10px;
+      padding: 6px 8px;
+      background: var(--error-bg);
+      color: var(--error-fg);
+      border: 1px solid var(--error-border);
+    }
+    .footer {
+      display: flex; gap: 8px; align-items: center;
+      margin: 0 10px 10px;
+    }
+    .bar {
+      flex: 1; height: 12px; background: var(--trough);
+      border: 1px solid var(--trough); border-radius: 2px; overflow: hidden;
+    }
+    .bar > i {
+      display: block; height: 100%; width: 42%;
+      background: var(--accent);
+    }
+    .hint { color: var(--secondary); font-size: 11px; margin: 0 10px 10px; }
+    .hexes {
+      font-family: ui-monospace, Consolas, monospace;
+      font-size: 10px;
+      color: #444;
+      padding: 0 12px 12px;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <h1>MTS to DNxHR — color scheme mockups</h1>
+  <p class="intro">
+    Side-by-side previews of the five light themes. The live app currently follows
+    whichever scheme is in <code>_Palette</code> (scheme 2 after this pass).
+    Open this file in a browser to compare. Status colors tint the whole row in the real ttk Treeview.
+  </p>
+  <div class="grid" id="grid"></div>
+  <script>
+    const schemes = [
+      {
+        id: 1, name: "Slate + teal", vibe: "Broadcast / NLE (recommended default)",
+        SURFACE: "#eef2f4", FIELD: "#ffffff", STRIPE: "#e8eef1",
+        TEXT: "#1a1a1a", TEXT_SECONDARY: "#4a5560", TEXT_DISABLED: "#6b7280",
+        BORDER: "#8a969e", HEADING_BG: "#d7e0e4", HEADING_FG: "#1a1a1a", HEADING_ACTIVE: "#c5d1d7",
+        ACCENT: "#0f766e", ACCENT_ACTIVE: "#0b5f59", ACCENT_FG: "#ffffff",
+        SELECT_BG: "#ccfbf1", OK_FG: "#166534", FAILED_FG: "#b91c1c", ACTIVE_FG: "#0f766e", MUTED_FG: "#4a5560",
+        ERROR_BG: "#fef2f2", ERROR_FG: "#b91c1c", ERROR_BORDER: "#f1a8a8",
+        DROP_BG: "#ffffff", DROP_HOT_BG: "#d5f5f0", DROP_PAUSED_BG: "#e2e8eb",
+        DROP_BORDER: "#8a969e", DROP_HOT_BORDER: "#0f766e", DISABLED_BG: "#c5cdd1", TROUGH: "#d5dee3",
+      },
+      {
+        id: 2, name: "Graphite + amber", vibe: "Pro tooling — Convert stands out",
+        SURFACE: "#f0f0ee", FIELD: "#ffffff", STRIPE: "#eaeae6",
+        TEXT: "#1a1a1a", TEXT_SECONDARY: "#4d4d4d", TEXT_DISABLED: "#6b6b6b",
+        BORDER: "#8f8f88", HEADING_BG: "#e2e2de", HEADING_FG: "#1a1a1a", HEADING_ACTIVE: "#d4d4ce",
+        ACCENT: "#c2410c", ACCENT_ACTIVE: "#9a3412", ACCENT_FG: "#ffffff",
+        SELECT_BG: "#ffedd5", OK_FG: "#166534", FAILED_FG: "#991b1b", ACTIVE_FG: "#9a3412", MUTED_FG: "#4d4d4d",
+        ERROR_BG: "#fef2f2", ERROR_FG: "#991b1b", ERROR_BORDER: "#f0b4b4",
+        DROP_BG: "#ffffff", DROP_HOT_BG: "#fff7ed", DROP_PAUSED_BG: "#e8e8e4",
+        DROP_BORDER: "#8f8f88", DROP_HOT_BORDER: "#c2410c", DISABLED_BG: "#cfcfc8", TROUGH: "#e0e0da",
+      },
+      {
+        id: 3, name: "Cool ink + cyan", vibe: "Tech / capture — closest to the old blue",
+        SURFACE: "#eef1f6", FIELD: "#ffffff", STRIPE: "#e6ebf3",
+        TEXT: "#1a1a1a", TEXT_SECONDARY: "#445066", TEXT_DISABLED: "#6b7280",
+        BORDER: "#8a93a3", HEADING_BG: "#dde3ee", HEADING_FG: "#1a1a1a", HEADING_ACTIVE: "#c9d2e2",
+        ACCENT: "#0369a1", ACCENT_ACTIVE: "#075985", ACCENT_FG: "#ffffff",
+        SELECT_BG: "#e0f2fe", OK_FG: "#047857", FAILED_FG: "#be123c", ACTIVE_FG: "#0369a1", MUTED_FG: "#445066",
+        ERROR_BG: "#fff1f2", ERROR_FG: "#be123c", ERROR_BORDER: "#f0a8b8",
+        DROP_BG: "#ffffff", DROP_HOT_BG: "#e8f6fe", DROP_PAUSED_BG: "#e4e8ef",
+        DROP_BORDER: "#8a93a3", DROP_HOT_BORDER: "#0369a1", DISABLED_BG: "#c8ced8", TROUGH: "#d9e0ea",
+      },
+      {
+        id: 4, name: "Warm paper + forest", vibe: "Softer chrome, serious green accent",
+        SURFACE: "#f4f1ec", FIELD: "#fffcf7", STRIPE: "#efe9e0",
+        TEXT: "#1a1a1a", TEXT_SECONDARY: "#524a40", TEXT_DISABLED: "#6f675c",
+        BORDER: "#9a9082", HEADING_BG: "#e6e0d6", HEADING_FG: "#1a1a1a", HEADING_ACTIVE: "#d6cec2",
+        ACCENT: "#3f6212", ACCENT_ACTIVE: "#365314", ACCENT_FG: "#ffffff",
+        SELECT_BG: "#ecfccb", OK_FG: "#3f6212", FAILED_FG: "#9f1239", ACTIVE_FG: "#3f6212", MUTED_FG: "#524a40",
+        ERROR_BG: "#fff1f2", ERROR_FG: "#9f1239", ERROR_BORDER: "#e8a0b0",
+        DROP_BG: "#fffcf7", DROP_HOT_BG: "#f3f8e8", DROP_PAUSED_BG: "#ebe4da",
+        DROP_BORDER: "#9a9082", DROP_HOT_BORDER: "#3f6212", DISABLED_BG: "#d2cbc0", TROUGH: "#e2dbd1",
+      },
+      {
+        id: 5, name: "Soft charcoal + indigo", vibe: "Modern utility — punchiest accent",
+        SURFACE: "#e8eaee", FIELD: "#fafbfc", STRIPE: "#dde1e8",
+        TEXT: "#1a1a1a", TEXT_SECONDARY: "#3f4654", TEXT_DISABLED: "#6b7280",
+        BORDER: "#8b93a3", HEADING_BG: "#cfd5de", HEADING_FG: "#1a1a1a", HEADING_ACTIVE: "#bdc5d2",
+        ACCENT: "#4338ca", ACCENT_ACTIVE: "#3730a3", ACCENT_FG: "#ffffff",
+        SELECT_BG: "#e0e7ff", OK_FG: "#15803d", FAILED_FG: "#b91c1c", ACTIVE_FG: "#4338ca", MUTED_FG: "#3f4654",
+        ERROR_BG: "#fef2f2", ERROR_FG: "#b91c1c", ERROR_BORDER: "#f0a8a8",
+        DROP_BG: "#fafbfc", DROP_HOT_BG: "#eef2ff", DROP_PAUSED_BG: "#dde1e8",
+        DROP_BORDER: "#8b93a3", DROP_HOT_BORDER: "#4338ca", DISABLED_BG: "#c5cad3", TROUGH: "#d4d9e2",
+      },
+    ];
+
+    // Darken OK for scheme 5 stripe contrast if needed in notes — mock uses listed values.
+    const grid = document.getElementById("grid");
+    for (const s of schemes) {
+      const el = document.createElement("article");
+      el.className = "card";
+      el.style.setProperty("--surface", s.SURFACE);
+      el.style.setProperty("--field", s.FIELD);
+      el.style.setProperty("--stripe", s.STRIPE);
+      el.style.setProperty("--text", s.TEXT);
+      el.style.setProperty("--secondary", s.TEXT_SECONDARY);
+      el.style.setProperty("--text-disabled", s.TEXT_DISABLED);
+      el.style.setProperty("--border", s.BORDER);
+      el.style.setProperty("--heading", s.HEADING_BG);
+      el.style.setProperty("--heading-fg", s.HEADING_FG);
+      el.style.setProperty("--accent", s.ACCENT);
+      el.style.setProperty("--accent-fg", s.ACCENT_FG);
+      el.style.setProperty("--select", s.SELECT_BG);
+      el.style.setProperty("--ok", s.OK_FG);
+      el.style.setProperty("--failed", s.FAILED_FG);
+      el.style.setProperty("--active", s.ACTIVE_FG);
+      el.style.setProperty("--muted", s.MUTED_FG);
+      el.style.setProperty("--error-bg", s.ERROR_BG);
+      el.style.setProperty("--error-fg", s.ERROR_FG);
+      el.style.setProperty("--error-border", s.ERROR_BORDER);
+      el.style.setProperty("--drop", s.DROP_BG);
+      el.style.setProperty("--drop-hot", s.DROP_HOT_BG);
+      el.style.setProperty("--drop-border", s.DROP_BORDER);
+      el.style.setProperty("--drop-hot-border", s.DROP_HOT_BORDER);
+      el.style.setProperty("--disabled", s.DISABLED_BG);
+      el.style.setProperty("--trough", s.TROUGH);
+
+      el.innerHTML = `
+        <header>
+          <strong>${s.id}. ${s.name}</strong>
+          <span>${s.vibe}</span>
+        </header>
+        <div class="swatches" aria-hidden="true">
+          ${["SURFACE","FIELD","HEADING_BG","ACCENT","SELECT_BG","OK_FG","FAILED_FG","DROP_HOT_BG"].map(k =>
+            `<div class="swatch" style="background:${s[k]}" title="${k} ${s[k]}"></div>`
+          ).join("")}
+        </div>
+        <div class="mock">
+          <div class="win">
+            <div class="titlebar">MTS to DNxHR</div>
+            <div class="drop">
+              <div>Drop .MTS / .M2TS files or folders here</div>
+              <div class="sub">or click to browse</div>
+              <div class="btn-row"><span class="btn">Add files…</span><span class="btn">Add folder…</span></div>
+            </div>
+            <div class="drop hot"><div class="sub">Drag highlight (hot)</div></div>
+            <div class="toolbar"><span>Clips: 3</span><span><span class="btn">Remove</span> <span class="btn">Clear</span></span></div>
+            <table>
+              <thead><tr><th>File ▲</th><th>Status</th><th>Size</th></tr></thead>
+              <tbody>
+                <tr class="stripe"><td>clip1.mts</td><td class="st-wait">Waiting</td><td>335 MB</td></tr>
+                <tr class="sel"><td>Clip2.MTS</td><td class="st-active">Converting 42%</td><td>128 MB</td></tr>
+                <tr><td>clip10.MTS</td><td class="st-ok">Done</td><td>96 MB</td></tr>
+                <tr class="stripe"><td>bad.MTS</td><td class="st-fail">Failed (double-click…)</td><td>12 MB</td></tr>
+              </tbody>
+            </table>
+            <fieldset class="settings">
+              <legend>Export settings</legend>
+              <div class="row"><span>Export to:</span><span class="field">D:\\Exports\\DNxHR</span><span class="btn">Browse…</span></div>
+              <div class="row">
+                <span class="check"> </span> Deinterlace
+                <span class="check on">✓</span> GPU decode
+                <span>Parallel streams:</span><span class="field" style="flex:0;width:2.5rem">2</span>
+                <span class="sub" style="color:var(--secondary)">(suggested max 2)</span>
+              </div>
+            </fieldset>
+            <div class="banner">FFmpeg not found — install it, then Check again.</div>
+            <div class="hint">Add clips, choose an export folder, then click Convert.</div>
+            <div class="footer">
+              <div class="bar"><i></i></div>
+              <span class="btn accent">Convert</span>
+              <span class="btn disabled">Convert</span>
+            </div>
+          </div>
+        </div>
+        <div class="hexes">
+          Surface ${s.SURFACE} · Field ${s.FIELD} · Heading ${s.HEADING_BG}<br/>
+          Accent ${s.ACCENT} / ${s.ACCENT_ACTIVE} · Select ${s.SELECT_BG}<br/>
+          OK ${s.OK_FG} · Failed ${s.FAILED_FG} · Drop hot ${s.DROP_HOT_BG}
+        </div>
+      `;
+      grid.appendChild(el);
+    }
+  </script>
+</body>
+</html>
