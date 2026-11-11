@@ -165,11 +165,14 @@ class DiscoveryTests(unittest.TestCase):
             self.root / "dnxhr" / "A.mxf",
         )
         self.assertEqual(m.default_output_dir(clip), self.root / "dnxhr")
+        self.assertEqual(m.default_output_dir(clip, "dnxhr_hq"), self.root / "dnxhr")
+        self.assertEqual(m.default_output_dir(clip, "remux"), self.root / "remux")
 
         footage = self.root / "footage"
         footage.mkdir()
         slashed = Path(str(footage) + os.sep)
         self.assertEqual(m.default_output_dir(slashed), self.root / "footage_dnxhr")
+        self.assertEqual(m.default_output_dir(slashed, "remux"), self.root / "footage_remux")
 
     def test_collisions_are_case_insensitive_on_windows(self) -> None:
         out = self.root / "out"
@@ -292,6 +295,85 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-i") + 1], str(self.src.resolve()))
         self.assertEqual(cmd[-1], str(self.dst.resolve()))
         self.assertGreater(len(cmd[cmd.index("-i") + 1].split(" ")), 1)
+
+    def test_remux_copies_video_and_encodes_aac(self) -> None:
+        cmd = m.build_command(
+            "ffmpeg",
+            self.src,
+            self.dst.with_suffix(".mp4"),
+            _opts(profile="remux", container="mp4"),
+            _interlaced(),
+            False,
+        )
+        _assert_sequence(self, cmd, ["-fflags", "+genpts"])
+        _assert_sequence(
+            self,
+            cmd,
+            [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+            ],
+        )
+        self.assertLess(cmd.index("-fflags"), cmd.index("-i"))
+        self.assertLess(cmd.index("-i"), cmd.index("-c:v"))
+        self.assertNotIn("-hwaccel", cmd)
+        joined = " ".join(cmd)
+        self.assertNotIn("dnx", joined)
+        self.assertNotIn("pcm", joined)
+        self.assertNotIn("yadif", joined)
+        self.assertNotIn("-vf", cmd)
+        self.assertNotIn("-pix_fmt", cmd)
+        self.assertNotIn("-field_order", cmd)
+        self.assertNotIn("-profile:v", cmd)
+
+        off = m.build_command(
+            "ffmpeg",
+            self.src,
+            self.dst.with_suffix(".mp4"),
+            _opts(
+                profile="remux",
+                container="mp4",
+                hwaccel="off",
+                deinterlace=True,
+                duration=3,
+            ),
+            _interlaced(),
+            True,
+        )
+        self.assertNotIn("-hwaccel", off)
+        self.assertIn("-y", off)
+        self.assertEqual(off[off.index("-t") + 1], "3")
+        self.assertNotIn("yadif", off)
+        self.assertIn("+genpts", off)
+        self.assertEqual(off[off.index("-c:v") + 1], "copy")
+
+    def test_options_require_remux_mp4_pairing(self) -> None:
+        m.Options(
+            profile="remux",
+            container="mp4",
+            audio_bit_depth=16,
+            deinterlace=False,
+            overwrite=False,
+            duration=None,
+        )
+        _opts(profile="dnxhr_hq", container="mxf")
+        for kwargs in (
+            {"profile": "remux", "container": "mov"},
+            {"profile": "remux", "container": "mxf"},
+            {"profile": "dnxhr_hqx", "container": "mp4"},
+        ):
+            with self.assertRaises(ValueError):
+                _opts(**kwargs)
 
     def test_hwaccel_off_omits_flag_and_auto_is_passed(self) -> None:
         off = m.build_command(
@@ -562,10 +644,15 @@ class CliTests(unittest.TestCase):
         ):
             self.assertIn(flag, help_text)
         self.assertIn("testing aid", help_text)
+        self.assertIn("remux", help_text)
+        self.assertIn("does not decode audio", help_text)
+        self.assertNotIn("affects audio decode", help_text)
         args = parser.parse_args(["clip.MTS"])
         self.assertEqual(args.profile, "dnxhr_hqx")
         self.assertEqual(args.container, "mov")
+        self.assertFalse(args.container_set)
         self.assertEqual(args.audio_bit_depth, 16)
+        self.assertFalse(args.audio_bit_depth_set)
         self.assertFalse(args.deinterlace)
         self.assertFalse(args.overwrite)
         self.assertEqual(args.hwaccel, "cuda")
@@ -590,6 +677,74 @@ class CliTests(unittest.TestCase):
             self.assertIn("yuv422p10le", text)
             self.assertIn("pcm_s16le", text)
             self.assertFalse((root / "dnxhr").exists())
+
+    def test_remux_dry_run_copies_video_to_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            clip = root / "clip.MTS"
+            clip.write_bytes(b"")
+            stdout = io.StringIO()
+            with mock.patch("mts_to_dnxhr.find_tool", return_value=None), contextlib.redirect_stdout(
+                stdout
+            ):
+                code = m.main([str(clip), "--profile", "remux", "--dry-run"])
+            text = stdout.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn("profile: remux", text)
+            self.assertIn("container: mp4", text)
+            self.assertIn("audio: aac", text)
+            self.assertIn("hwaccel: unused", text)
+            self.assertNotIn("-hwaccel", text)
+            self.assertIn("-fflags +genpts", text)
+            self.assertIn("-c:v copy", text)
+            self.assertIn("-c:a aac", text)
+            self.assertIn("-b:a 192k", text)
+            self.assertIn("-ar 48000", text)
+            self.assertIn("-movflags +faststart", text)
+            self.assertIn("-f mp4", text)
+            self.assertIn(str((root / "remux" / "clip.mp4").resolve()), text)
+            self.assertNotIn("dnxhr", text)
+            self.assertNotIn("pcm_", text)
+            self.assertNotIn("yadif", text)
+            self.assertFalse((root / "remux").exists())
+
+            footage = root / "footage"
+            footage.mkdir()
+            nested = footage / "clip.MTS"
+            nested.write_bytes(b"")
+            folder_out = io.StringIO()
+            with mock.patch("mts_to_dnxhr.find_tool", return_value=None), contextlib.redirect_stdout(
+                folder_out
+            ):
+                code = m.main([str(footage), "--profile", "remux", "--container", "mp4", "--dry-run"])
+            folder_text = folder_out.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn(str((root / "footage_remux" / "clip.mp4").resolve()), folder_text)
+            self.assertNotIn("dnxhr", folder_text)
+
+    def test_remux_rejects_other_container_pcm_depth_and_deinterlace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            clip = Path(tmp).resolve() / "clip.MTS"
+            clip.write_bytes(b"")
+            cases = (
+                (["--container", "mov"], "mp4"),
+                (["--container", "mxf"], "mp4"),
+                (["--deinterlace"], "deinterlace"),
+                (["--audio-bit-depth", "16"], "audio-bit-depth"),
+                (["--audio-bit-depth", "24"], "audio-bit-depth"),
+            )
+            for extra, needle in cases:
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    code = m.main([str(clip), "--profile", "remux", "--dry-run", *extra])
+                self.assertEqual(code, 2, extra)
+                self.assertIn(needle, stderr.getvalue())
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = m.main([str(clip), "--container", "mp4", "--dry-run"])
+            self.assertEqual(code, 2)
+            self.assertIn("mp4", stderr.getvalue())
+            self.assertIn("remux", stderr.getvalue())
 
     def test_header_prints_jobs_and_above_suggestion_note(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

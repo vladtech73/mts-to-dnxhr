@@ -107,6 +107,38 @@ class DefaultsTests(unittest.TestCase):
         self.assertIn("yadif=mode=send_frame:parity=auto:deint=interlaced", interlaced_cmd)
         self.assertNotIn("yadif", progressive_cmd)
 
+    def test_remux_options_summary_and_size_ratio(self) -> None:
+        remux = gui.options_for(True, gpu_decode=False, mode="remux")
+        self.assertEqual(remux.profile, "remux")
+        self.assertEqual(remux.container, "mp4")
+        self.assertFalse(remux.deinterlace)
+        self.assertEqual(remux.hwaccel, "off")
+        self.assertEqual(gui.options_for(False, gpu_decode=True, mode="remux").hwaccel, "off")
+        cmd = core.build_command(
+            "ffmpeg",
+            Path("in.mts"),
+            Path("out.mp4"),
+            remux,
+            _interlaced(),
+            force=True,
+        )
+        self.assertNotIn("-hwaccel", cmd)
+        self.assertIn("copy", cmd)
+        self.assertIn("aac", cmd)
+        self.assertNotIn("dnxhd", cmd)
+        self.assertNotIn("yadif", cmd)
+        self.assertEqual(
+            gui.summary_for_mode("remux"),
+            "Remux MP4 · H.264 copy · AAC 192 kb/s 48 kHz · source size/fps",
+        )
+        self.assertEqual(gui.summary_for_mode("dnxhr"), gui.OUTPUT_SUMMARY)
+        self.assertEqual(gui.size_ratio_for_mode("remux"), 1)
+        self.assertEqual(gui.size_ratio_for_mode("dnxhr"), gui.SIZE_RATIO)
+        self.assertNotIn("14", gui.low_space_detail("remux"))
+        self.assertIn("14", gui.low_space_detail("dnxhr"))
+        self.assertEqual(gui.profile_for_mode("remux"), "remux")
+        self.assertEqual(gui.profile_for_mode("dnxhr"), gui.DEFAULT_OPTIONS.profile)
+
 
 class CollectItemsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -230,6 +262,7 @@ class PlanAndSpaceTests(unittest.TestCase):
             gui.estimate_needed_bytes([(src, dst), (missing, self.root / "gone.mov")]),
             100 * gui.SIZE_RATIO,
         )
+        self.assertEqual(gui.estimate_needed_bytes([(src, dst)], ratio=1), 100)
         dst.write_bytes(b"already")
         self.assertEqual(gui.estimate_needed_bytes([(src, dst)]), 0)
         out = self.root / "not-yet" / "dnxhr"
@@ -949,6 +982,61 @@ class AppTableTests(unittest.TestCase):
         width = int(self.app.tree.column("file", "width"))
         self.assertGreaterEqual(width, int(self.app.tree.column("file", "minwidth")))
         self.assertLessEqual(width, self.app._px(600))
+
+    def test_remux_mode_refreshes_auto_folder_and_disables_deinterlace(self) -> None:
+        self.assertIn("DNxHR HQX", self.app.summary.cget("text"))
+        self.assertEqual(Path(self.app.export_var.get()).name, "dnxhr")
+        self.app.deinterlace_var.set(True)
+        self.app.mode_var.set("remux")
+        self.assertEqual(Path(self.app.export_var.get()).name, "remux")
+        self.assertIn("Remux MP4", self.app.summary.cget("text"))
+        self.assertIn("AAC", self.app.summary.cget("text"))
+        self.assertEqual(str(self.app.deinterlace_chk.cget("state")), "disabled")
+        self.assertEqual(str(self.app.gpu_decode_chk.cget("state")), "disabled")
+        self.assertTrue(self.app.deinterlace_var.get())
+        self.assertTrue(self.app.gpu_decode_var.get())
+        self.app.mode_var.set("dnxhr")
+        self.assertEqual(Path(self.app.export_var.get()).name, "dnxhr")
+        self.assertEqual(str(self.app.deinterlace_chk.cget("state")), "normal")
+        self.assertEqual(str(self.app.gpu_decode_chk.cget("state")), "normal")
+        self.assertTrue(self.app.deinterlace_var.get())
+        custom = Path(self._tmp.name) / "custom-out"
+        self.app.export_var.set(str(custom))
+        self.app.mode_var.set("remux")
+        self.assertEqual(Path(self.app.export_var.get()), custom)
+        self.assertEqual(str(self.app.deinterlace_chk.cget("state")), "disabled")
+        self.assertEqual(str(self.app.gpu_decode_chk.cget("state")), "disabled")
+
+    def test_start_batch_uses_remux_mp4_and_one_times_estimate(self) -> None:
+        self.app.mode_var.set("remux")
+        self.app.deinterlace_var.set(True)
+        captured: dict[str, object] = {}
+
+        def fake_thread(*_args: object, **kwargs: object) -> mock.Mock:
+            captured["args"] = kwargs.get("args")
+            worker = mock.Mock()
+            worker.start = mock.Mock()
+            worker.is_alive = mock.Mock(return_value=False)
+            return worker
+
+        with mock.patch.object(gui.threading, "Thread", side_effect=fake_thread), mock.patch.object(
+            self.app.root, "after", return_value="idle"
+        ), mock.patch.object(
+            gui, "estimate_needed_bytes", wraps=gui.estimate_needed_bytes
+        ) as estimate:
+            self.app._start_batch()
+        self.app.running = False
+        args = captured["args"]
+        assert isinstance(args, tuple)
+        pairs, opts = args[0], args[1]
+        self.assertEqual(opts.profile, "remux")
+        self.assertEqual(opts.container, "mp4")
+        self.assertFalse(opts.deinterlace)
+        self.assertEqual(opts.hwaccel, "off")
+        self.assertEqual(estimate.call_args.kwargs["ratio"], 1)
+        for _src, dst in pairs:
+            self.assertEqual(dst.suffix, ".mp4")
+            self.assertEqual(dst.parent.name, "remux")
 
     def test_heading_double_click_does_not_open_error_dialog(self) -> None:
         iid = self.app.tree.get_children()[0]

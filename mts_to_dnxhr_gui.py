@@ -1,4 +1,4 @@
-"""Desktop window for converting AVCHD clips to DNxHR.
+"""Desktop window for converting AVCHD clips to DNxHR, or remuxing them to MP4.
 
 The encode path is ``mts_to_dnxhr``. This module only collects files, checks
 the export folder, and draws progress. A windowed PyInstaller build has no
@@ -437,11 +437,59 @@ OUTPUT_SUMMARY = (
 )
 
 
-def options_for(deinterlace: bool, *, gpu_decode: bool = True) -> core.Options:
+def options_for(
+    deinterlace: bool,
+    *,
+    gpu_decode: bool = True,
+    mode: str = "dnxhr",
+) -> core.Options:
+    hwaccel = "cuda" if gpu_decode else "off"
+    if mode == "remux":
+        # Video is copied, so the GPU-decode checkbox does not change the command.
+        return dataclasses.replace(
+            DEFAULT_OPTIONS,
+            profile="remux",
+            container="mp4",
+            deinterlace=False,
+            hwaccel="off",
+        )
     return dataclasses.replace(
         DEFAULT_OPTIONS,
         deinterlace=deinterlace,
-        hwaccel="cuda" if gpu_decode else "off",
+        hwaccel=hwaccel,
+    )
+
+
+def summary_for_mode(mode: str) -> str:
+    if mode == "remux":
+        return "Remux MP4 · H.264 copy · AAC 192 kb/s 48 kHz · source size/fps"
+    return OUTPUT_SUMMARY
+
+
+def size_ratio_for_mode(mode: str) -> int:
+    """DNxHR HQX expands about 14×. Remux stays about the same size as the camera file."""
+    if mode == "remux":
+        return 1
+    return SIZE_RATIO
+
+
+def profile_for_mode(mode: str) -> str:
+    if mode == "remux":
+        return "remux"
+    return DEFAULT_OPTIONS.profile
+
+
+def low_space_detail(mode: str) -> str:
+    if mode == "remux":
+        return "Remux MP4 files are about the same size as the camera files."
+    return "DNxHR HQX files are roughly 14× larger than camera files."
+
+
+def _paths_match(text: str, folder: Path) -> bool:
+    if not text:
+        return False
+    return os.path.normcase(os.path.normpath(text)) == os.path.normcase(
+        os.path.normpath(str(folder))
     )
 
 
@@ -517,14 +565,21 @@ def plan_outputs(
     return pairs, core.find_collisions(pairs)
 
 
-def estimate_needed_bytes(pairs: Sequence[tuple[Path, Path]]) -> int:
-    """Sum ``source size × 14`` for outputs that do not exist yet."""
+def estimate_needed_bytes(
+    pairs: Sequence[tuple[Path, Path]],
+    *,
+    ratio: int = SIZE_RATIO,
+) -> int:
+    """Sum ``source size × ratio`` for outputs that do not exist yet.
+
+    DNxHR HQX uses ``SIZE_RATIO`` (about 14×). Remux uses 1.
+    """
     total = 0
     for src, dst in pairs:
         if dst.exists():
             continue
         try:
-            total += src.stat().st_size * SIZE_RATIO
+            total += src.stat().st_size * ratio
         except OSError:
             continue
     return total
@@ -938,6 +993,17 @@ def _apply_clam_styles(
         font=body,
     )
     style.configure(
+        "TRadiobutton",
+        background=_Palette.SURFACE,
+        foreground=_Palette.TEXT,
+        font=body,
+    )
+    style.map(
+        "TRadiobutton",
+        background=[("active", _Palette.SURFACE), ("disabled", _Palette.SURFACE)],
+        foreground=[("disabled", _Palette.TEXT_DISABLED)],
+    )
+    style.configure(
         "TLabelframe",
         background=_Palette.SURFACE,
         foreground=_Palette.TEXT,
@@ -1121,13 +1187,13 @@ class App:
         self.root.geometry(
             "{0}x{1}".format(
                 min(self._px(1024), root.winfo_screenwidth() - self._px(40)),
-                min(self._px(660), root.winfo_screenheight() - self._px(80)),
+                min(self._px(700), root.winfo_screenheight() - self._px(80)),
             )
         )
-        # 800×580 is the smallest 100% size that keeps the options row and the
-        # FFmpeg banner intact, with two clip rows still visible.
+        # 800×620 is the smallest 100% size that keeps the mode row, the options
+        # row, and the FFmpeg banner intact, with two clip rows still visible.
         min_w = min(self._px(800), root.winfo_screenwidth() - self._px(40))
-        min_h = min(self._px(580), root.winfo_screenheight() - self._px(80))
+        min_h = min(self._px(620), root.winfo_screenheight() - self._px(80))
         self.root.minsize(min_w, min_h)
         if sys.platform == "win32":
             try:
@@ -1154,6 +1220,8 @@ class App:
         self._batch_t0: Optional[float] = None
         self._active: dict[int, _ActiveFile] = {}
         self._batch_jobs = 1
+        # Set when Export to still holds the automatic dnxhr/remux folder.
+        self._auto_export_root: Optional[Path] = None
 
         self._build()
         self._apply_tools_banner()
@@ -1279,8 +1347,28 @@ class App:
         self.browse_btn.grid(row=0, column=2, padx=(self._px(6), 0))
         self.export_var.trace_add("write", self._on_export_changed)
 
+        mode_row = ttk.Frame(settings)
+        mode_row.grid(row=1, column=0, sticky="ew", pady=(0, gap))
+        ttk.Label(mode_row, text="Mode:").pack(side="left")
+        self.mode_var = tk.StringVar(value="dnxhr")
+        self.mode_dnxhr = ttk.Radiobutton(
+            mode_row,
+            text="DNxHR HQX",
+            value="dnxhr",
+            variable=self.mode_var,
+        )
+        self.mode_remux = ttk.Radiobutton(
+            mode_row,
+            text="Remux MP4",
+            value="remux",
+            variable=self.mode_var,
+        )
+        self.mode_dnxhr.pack(side="left", padx=(self._px(8), self._px(12)))
+        self.mode_remux.pack(side="left")
+        self.mode_var.trace_add("write", self._on_mode_changed)
+
         options = ttk.Frame(settings)
-        options.grid(row=1, column=0, sticky="ew")
+        options.grid(row=2, column=0, sticky="ew")
         # Concurrent convert jobs (each job already includes decode + DNxHR encode).
         ttk.Label(options, text="Parallel streams:").pack(side="left")
         self.jobs_var = tk.IntVar(value=2)
@@ -1446,6 +1534,33 @@ class App:
             self.banner_label.configure(wraplength=max(self._px(240), event.width - self._px(160)))
 
     def _on_export_changed(self, *_args: object) -> None:
+        self._note_export_edit()
+        if not self.running:
+            self._update_buttons()
+
+    def _note_export_edit(self) -> None:
+        """Drop the auto-folder mark when the path is no longer a generated default."""
+        root = self._auto_export_root
+        if root is None:
+            return
+        current = self.export_var.get().strip()
+        dnxhr = core.default_output_dir(root, profile_for_mode("dnxhr"))
+        remux = core.default_output_dir(root, profile_for_mode("remux"))
+        if _paths_match(current, dnxhr) or _paths_match(current, remux):
+            return
+        self._auto_export_root = None
+
+    def _on_mode_changed(self, *_args: object) -> None:
+        mode = self.mode_var.get()
+        previous = "remux" if mode != "remux" else "dnxhr"
+        root = self._auto_export_root
+        if root is not None:
+            previous_dir = core.default_output_dir(root, profile_for_mode(previous))
+            if _paths_match(self.export_var.get().strip(), previous_dir):
+                self.export_var.set(
+                    str(core.default_output_dir(root, profile_for_mode(mode)))
+                )
+        self.summary.configure(text="Output: {0}".format(summary_for_mode(mode)))
         if not self.running:
             self._update_buttons()
 
@@ -1497,7 +1612,11 @@ class App:
             self.status_var.set(message)
             return
         if not self.export_var.get().strip():
-            self.export_var.set(str(core.default_output_dir(staged[0][0].root)))
+            root = staged[0][0].root
+            self._auto_export_root = root
+            self.export_var.set(
+                str(core.default_output_dir(root, profile_for_mode(self.mode_var.get())))
+            )
         for item, size, mtime in staged:
             self._seq += 1
             iid = self.tree.insert(
@@ -1626,8 +1745,11 @@ class App:
         self.clear_btn.configure(state=busy)
         self.browse_btn.configure(state=busy)
         self.export_entry.configure(state="normal")
-        self.deinterlace_chk.configure(state="normal")
-        self.gpu_decode_chk.configure(state="normal")
+        option_state = "disabled" if self.mode_var.get() == "remux" else "normal"
+        self.deinterlace_chk.configure(state=option_state)
+        self.gpu_decode_chk.configure(state=option_state)
+        self.mode_dnxhr.configure(state="normal")
+        self.mode_remux.configure(state="normal")
         self.jobs_combo.set_enabled(True)
         ready = bool(self._rows) and bool(self.export_var.get().strip()) and self._tools_ready()
         self.convert_btn.configure(text="Convert", state="normal" if ready else "disabled")
@@ -1641,6 +1763,8 @@ class App:
         self.browse_btn.configure(state=state)
         self.export_entry.configure(state=state)
         self.deinterlace_chk.configure(state=state)
+        self.mode_dnxhr.configure(state=state)
+        self.mode_remux.configure(state=state)
         self.gpu_decode_chk.configure(state=state)
         self.jobs_combo.set_enabled(not running)
         if running:
@@ -1771,10 +1895,14 @@ class App:
                 parent=self.root,
             )
             return
+        mode = self.mode_var.get()
+        opts = options_for(
+            bool(self.deinterlace_var.get()),
+            gpu_decode=bool(self.gpu_decode_var.get()),
+            mode=mode,
+        )
         try:
-            pairs, collisions = plan_outputs(
-                items, out_dir, DEFAULT_OPTIONS.container
-            )
+            pairs, collisions = plan_outputs(items, out_dir, opts.container)
         except ValueError as exc:
             messagebox.showerror("MTS to DNxHR", str(exc), parent=self.root)
             return
@@ -1787,17 +1915,18 @@ class App:
             lines.append("Remove one of these clips, or convert them in separate runs.")
             messagebox.showerror("Name clash", "\n".join(lines), parent=self.root)
             return
-        needed = estimate_needed_bytes(pairs)
+        needed = estimate_needed_bytes(pairs, ratio=size_ratio_for_mode(mode))
         free = free_bytes(out_dir)
         if free is not None and needed > free:
             drive = out_dir.drive or str(out_dir.anchor)
             proceed = messagebox.askyesno(
                 "Low disk space",
                 "This batch may need about {0:.1f} GB, but only {1:.1f} GB is free on {2}. "
-                "DNxHR HQX files are roughly 14× larger than camera files. Convert anyway?".format(
+                "{3} Convert anyway?".format(
                     needed / 1e9,
                     free / 1e9,
                     drive,
+                    low_space_detail(mode),
                 ),
                 default="no",
                 parent=self.root,
@@ -1829,10 +1958,6 @@ class App:
         self.cancel = threading.Event()
         self.running = True
         self._set_running_ui(True)
-        opts = options_for(
-            bool(self.deinterlace_var.get()),
-            gpu_decode=bool(self.gpu_decode_var.get()),
-        )
         self.worker = threading.Thread(
             target=run_batch,
             args=(pairs, opts, self.ffmpeg, self.ffprobe, self.events.put, self.cancel),

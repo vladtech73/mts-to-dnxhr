@@ -45,7 +45,7 @@ Rates below are video bitrate at 1920×1080, `30000/1001`, measured with FFmpeg 
 | `dnxhr_lb` | 8-bit | 4:2:2 (`yuv422p`) | ~45 Mb/s | ~0.35 GB | Proxies. |
 | `dnxhr_444` | 10-bit | 4:4:4 (`yuv444p10le`) | ~440 Mb/s | ~3.3 GB | Rarely useful for 4:2:0 AVCHD. The encoder upsamples; it does not recover chroma. |
 
-A full HQX or HQ encode of a 168-second 1080i clip is about 4.7 GB (about 14× a 335 MB source). LB is about 1.0 GB, SQ about 3.1 GB, and 444 about 9.3 GB for that same duration. The CLI does not check free space before encoding. The desktop app warns when the estimate (about 14× the source size of files that are not already in the export folder) is larger than the free space on that drive.
+A full HQX or HQ encode of a 168-second 1080i clip is about 4.7 GB (about 14× a 335 MB source). LB is about 1.0 GB, SQ about 3.1 GB, and 444 about 9.3 GB for that same duration. The CLI does not check free space before encoding. The desktop app warns when the estimate (about 14× the source size for DNxHR HQX, or about 1× for remux, counting files that are not already in the export folder) is larger than the free space on that drive.
 
 ### Verified on FFmpeg 8.0.1
 
@@ -72,6 +72,22 @@ Four copies of that sample, first 30 seconds each, default HQX MOV, written to a
 
 Two streams were faster than one. A third was not, so the suggestion caps at 2. Each ffmpeg process used about 1.8 GB.
 
+## Remux to MP4
+
+`--profile remux` copies the H.264 video into an `.mp4` and re-encodes the audio to AAC at 192 kb/s, 48 kHz. Channel count follows the source. Video is not re-encoded, so the file stays close to the camera size (about 1×) instead of the DNxHR expansion. This is not a pure stream copy: AC-3 is not kept, because Resolve often plays that audio silent. The command passes `-fflags +genpts` so MPEG-TS timestamps survive in the MP4, and `-movflags +faststart` so playback can start before the file is fully read.
+
+The container is always `.mp4`. `--container mov` or `--container mxf` with `--profile remux` is an error. `--audio-bit-depth` and `--deinterlace` are also errors. PCM bit depth does not apply, and deinterlace needs a video filter, which cannot run while the video stream is copied. `--container mp4` on a DNxHR profile is an error too.
+
+`--hwaccel` has no effect with `--profile remux`. It only selects a hardware video decoder, and remux copies the video instead of decoding it. Audio decode does not use the GPU, so the remux command omits `-hwaccel`.
+
+A file input writes to `<file parent>/remux/`. A folder input writes to a sibling `<parent>/<folder name>_remux/`. `clip.MTS` becomes `remux/clip.mp4`.
+
+```powershell
+python mts_to_dnxhr.py "samples/01 American Landscape.MTS" --profile remux --dry-run
+```
+
+The desktop app has the same choice under Export settings: **DNxHR HQX** (the default) or **Remux MP4**. Remux disables deinterlace and GPU decode, and estimates disk use at about 1× the source size. Switching modes updates the export folder when it is still the automatic `dnxhr` / `remux` path, or the matching `*_dnxhr` / `*_remux` sibling. A folder you typed or browsed to is left alone.
+
 ## Usage
 
 Quote paths that contain spaces.
@@ -81,6 +97,7 @@ python mts_to_dnxhr.py "samples/01 American Landscape.MTS"
 python mts_to_dnxhr.py ./footage/
 python mts_to_dnxhr.py ./footage/ --recursive -o ./converted/
 python mts_to_dnxhr.py ./footage/ --profile dnxhr_hq --container mxf --audio-bit-depth 24
+python mts_to_dnxhr.py "samples/01 American Landscape.MTS" --profile remux
 ```
 
 Preview the ffmpeg command without writing a file. The printed command uses `-n` unless you also pass `--overwrite`, so pasting it will not replace an existing output. It starts with `ffmpeg` when that name is on `PATH`. If a quoted path containing spaces is printed instead, PowerShell needs the call operator: put `& ` in front of the pasted line.
@@ -114,15 +131,15 @@ python mts_to_dnxhr.py ./footage/ --jobs 2
 
 `--jobs N` converts up to N streams at once (1-4, default 2). Each job is a full convert (decode + DNxHR encode). `--help` prints a suggestion for this PC: `max(1, min(2, logical processors // 6))`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel stream uses about 2 GB of RAM.
 
-`--hwaccel` selects hardware decode (`cuda` by default; also `auto`, `d3d11va`, `qsv`, or `off`). DNxHR encode stays on the CPU. Use `--hwaccel off` to force software decode.
+`--hwaccel` selects hardware video decode (`cuda` by default; also `auto`, `d3d11va`, `qsv`, or `off`). DNxHR encode stays on the CPU. It has no effect with `--profile remux`, because the video is copied and audio decode never uses the GPU. Use `--hwaccel off` to force software decode for DNxHR.
 
-Other flags: `--profile` (`dnxhr_hqx` by default), `--deinterlace`, `--overwrite`, `--output`, `--recursive`, `--jobs`, `--hwaccel`. `--help` lists them.
+Other flags: `--profile` (`dnxhr_hqx` by default, or `remux`), `--deinterlace`, `--overwrite`, `--output`, `--recursive`, `--jobs`, `--hwaccel`. `--help` lists them.
 
 Exit codes: `0` every file converted or skipped, `1` at least one file failed (the batch continues), `2` usage or preflight error (bad path, no clips, FFmpeg missing, two inputs mapping to one output), `130` interrupted. Ctrl+C stops ffmpeg and deletes the partial file.
 
 ## Desktop app (Windows)
 
-The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. **GPU decode (hardware)** is on by default (`-hwaccel cuda`); uncheck it for software decode. **Parallel streams** runs from 1 to 4 converts at once and defaults to 2 — each stream already includes decode and encode for that clip. A hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel stream uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
+The desktop app drops `.MTS` / `.M2TS` files or folders, asks for one export folder, and converts with the CLI defaults: DNxHR HQX, `.mov`, 16-bit PCM at 48 kHz, source size and frame rate. **Mode** is **DNxHR HQX** or **Remux MP4** (see [Remux to MP4](#remux-to-mp4)). Deinterlace is off unless you tick **Deinterlace interlaced (1080i) clips**. **GPU decode (hardware)** is on by default for DNxHR (`-hwaccel cuda`); uncheck it for software decode. Remux disables both checkboxes, because the video stream is copied. **Parallel streams** runs from 1 to 4 converts at once and defaults to 2 — each stream already includes decode and encode for that clip. A hint shows the suggested maximum for this PC, such as `(suggested max 2 for this PC)`. Use 1 when the export folder is on a spinning disk or a USB drive. Each parallel stream uses about 2 GB of RAM. Existing outputs are skipped. A dropped folder is scanned recursively and the export mirrors its subfolders, same as `--recursive`. Dropping a card root nests `PRIVATE\AVCHD\BDMV\STREAM` under the export folder; drop the `STREAM` folder instead when you want a flat list of clips.
 
 Click a column heading to sort by that column, and click it again to reverse the order. Drag a heading divider to resize a column, or double-click a divider to fit the column to its content. Clips convert in the order shown. Size and Modified come from the source file.
 
@@ -151,10 +168,11 @@ To change the icon, replace `assets\app.ico` with another multi-size `.ico`, or 
 
 - A file input writes to `<file parent>/dnxhr/` when `--output` is omitted. `clip.MTS` becomes `dnxhr/clip.mov`.
 - A folder input writes to a sibling `<parent>/<folder name>_dnxhr/`, so the outputs are not inside the folder being scanned. `./footage/` becomes `./footage_dnxhr/`.
+- `--profile remux` uses `remux/` and `<folder name>_remux/` instead. `clip.MTS` becomes `remux/clip.mp4`.
 - `--recursive` mirrors subfolders under the output directory.
-- The stem is unchanged. The extension becomes `.mov` or `.mxf`.
+- The stem is unchanged. The extension becomes `.mov` or `.mxf` for DNxHR, and `.mp4` for remux.
 - An output that already exists is skipped unless `--overwrite` is set. Re-running prints `skipped` and exits 0.
-- The encoder writes `<name>.mov.part` (or `.mxf.part`) and renames it into place only after ffmpeg succeeds. A failed encode or Ctrl+C deletes the `.part` file.
+- The encoder writes `<name>.mov.part` (or `.mxf.part`, or `.mp4.part`) and renames it into place only after ffmpeg succeeds. A failed encode or Ctrl+C deletes the `.part` file.
 - If two inputs would write the same path (`A.MTS` and `A.M2TS` in one folder), the tool lists them and exits 2. Nothing is encoded.
 - Files that are not `.MTS` or `.M2TS` (`.CPI`, `.MPL`, notes, and so on) are counted in the header and not listed.
 
@@ -192,7 +210,7 @@ See `samples/README.md`. Media in that folder is gitignored and must not be comm
 
 ## Limitations
 
-- There is a minimal Windows GUI (DNxHR HQX, MOV, and 16-bit PCM only; use the CLI for other profiles). No installer, code signing, `pyproject.toml`, or bundled FFmpeg.
+- There is a minimal Windows GUI (DNxHR HQX in MOV with 16-bit PCM, or Remux MP4; use the CLI for other DNxHR profiles). No installer, code signing, `pyproject.toml`, or bundled FFmpeg.
 - Encodes run in software. Up to 4 streams can convert at once (default 2). There is no GPU encoder.
 - Spanned AVCHD recordings stay as separate files. Each clip converts on its own, so there is a cut at each file boundary. Frames are not dropped. Joining them, reading `.MPL` playlists, and preserving camera timecode are out of scope.
 - No 59.94p (field-rate) deinterlace, scaling, frame-rate conversion, color tagging, or LUTs.

@@ -1,7 +1,8 @@
 """Convert AVCHD .MTS/.M2TS clips to DNxHR intermediates for DaVinci Resolve.
 
-FFmpeg and ffprobe must be on PATH for a real encode. ``--dry-run`` prints
-commands even when they are missing. Nothing runs at import time.
+``--profile remux`` copies the H.264 video into an MP4 and encodes AAC audio
+instead. FFmpeg and ffprobe must be on PATH for a real encode. ``--dry-run``
+prints commands even when they are missing. Nothing runs at import time.
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ PROFILES = {
     "dnxhr_444": "yuv444p10le",
 }
 AUDIO_CODECS = {16: "pcm_s16le", 24: "pcm_s24le"}
-CONTAINERS = {"mov": "mov", "mxf": "mxf"}
+CONTAINERS = {"mov": "mov", "mxf": "mxf", "mp4": "mp4"}
+REMUX_PROFILE = "remux"
+PROFILE_CHOICES = tuple(PROFILES) + (REMUX_PROFILE,)
 INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
 YADIF = "yadif=mode=send_frame:parity=auto:deint=interlaced"
 MAX_JOBS = 4
@@ -75,6 +78,14 @@ class Options:
     overwrite: bool
     duration: Optional[float]
     hwaccel: str = "cuda"
+
+    def __post_init__(self) -> None:
+        """Remux is MP4-only. DNxHR stays on mov or mxf."""
+        remux = self.profile == REMUX_PROFILE
+        if remux != (self.container == "mp4"):
+            if remux:
+                raise ValueError("profile remux requires container mp4")
+            raise ValueError("container mp4 is only valid with profile remux")
 
 
 @dataclass(frozen=True)
@@ -137,12 +148,18 @@ def find_inputs(path: Path, recursive: bool) -> list[Path]:
     return inputs
 
 
-def default_output_dir(input_path: Path) -> Path:
-    """File input writes to ``<parent>/dnxhr``. A folder writes to a sibling."""
+def default_output_dir(input_path: Path, profile: str = "dnxhr_hqx") -> Path:
+    """File input writes beside itself. A folder writes to a sibling.
+
+    DNxHR uses ``dnxhr`` / ``<name>_dnxhr``. Remux uses ``remux`` / ``<name>_remux``.
+    """
+    remux = profile == REMUX_PROFILE
+    folder = "remux" if remux else "dnxhr"
+    suffix = "_remux" if remux else "_dnxhr"
     resolved = input_path.resolve()
     if resolved.is_file():
-        return resolved.parent / "dnxhr"
-    return resolved.parent / f"{resolved.name}_dnxhr"
+        return resolved.parent / folder
+    return resolved.parent / f"{resolved.name}{suffix}"
 
 
 def output_path_for(src: Path, input_root: Path, out_dir: Path, container: str) -> Path:
@@ -317,12 +334,36 @@ def build_command(
         "error",
         "-y" if force else "-n",
     ]
-    if opts.hwaccel != "off":
+    # -hwaccel selects a video decoder. Remux copies video, so the flag is omitted.
+    if opts.profile != REMUX_PROFILE and opts.hwaccel != "off":
         cmd.extend(["-hwaccel", opts.hwaccel])
+    if opts.profile == REMUX_PROFILE:
+        # Input flag: MPEG-TS timestamps need generating before they land in MP4.
+        cmd.extend(["-fflags", "+genpts"])
     cmd.extend(["-i", str(src.resolve())])
     if opts.duration is not None:
         cmd.extend(["-t", _duration_arg(opts.duration)])
     cmd.extend(["-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0"])
+    if opts.profile == REMUX_PROFILE:
+        # Video is copied. Audio is AAC, not a copy of the camera AC-3.
+        cmd.extend(
+            [
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-ar",
+                "48000",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+                str(dst.resolve()),
+            ]
+        )
+        return cmd
     # No probe data: still deinterlace when asked. deint=interlaced is a no-op
     # on frames that are already progressive.
     if opts.deinterlace and (info is None or info.interlaced):
@@ -744,6 +785,20 @@ def _jobs_arg(value: str) -> int:
     return jobs
 
 
+class _MarkSetAction(argparse.Action):
+    """Store a value and record that the user passed the flag."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: Optional[str] = None,
+    ) -> None:
+        setattr(namespace, self.dest, values)
+        setattr(namespace, self.dest + "_set", True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     class _Formatter(
         argparse.ArgumentDefaultsHelpFormatter,
@@ -755,7 +810,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mts_to_dnxhr.py",
         description=(
             "Convert AVCHD .MTS/.M2TS clips to DNxHR intermediates "
-            "that DaVinci Resolve can import, scrub, and play with audio."
+            "that DaVinci Resolve can import, scrub, and play with audio. "
+            "Use --profile remux to copy video into an MP4 and encode AAC audio."
         ),
         formatter_class=_Formatter,
         epilog=(
@@ -765,6 +821,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python mts_to_dnxhr.py ./footage/ --recursive -o ./converted/\n"
             "  python mts_to_dnxhr.py ./footage/ --profile dnxhr_hq "
             "--container mxf --audio-bit-depth 24\n"
+            '  python mts_to_dnxhr.py "samples/01 American Landscape.MTS" '
+            "--profile remux\n"
             "\n"
             "exit codes: 0 every file converted or skipped, "
             "1 at least one file failed, "
@@ -783,23 +841,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-p",
         "--profile",
-        choices=list(PROFILES),
+        choices=list(PROFILE_CHOICES),
         default="dnxhr_hqx",
-        help="DNxHR profile",
+        help="DNxHR profile, or remux (copy video to MP4 and encode AAC audio)",
     )
     parser.add_argument(
         "-c",
         "--container",
         choices=list(CONTAINERS),
         default="mov",
-        help="Output container",
+        action=_MarkSetAction,
+        help="Output container (mov or mxf for DNxHR; mp4 for remux)",
     )
     parser.add_argument(
         "--audio-bit-depth",
         type=int,
         choices=sorted(AUDIO_CODECS),
         default=16,
-        help="PCM bit depth. 24 has more headroom for grading",
+        action=_MarkSetAction,
+        help="PCM bit depth for DNxHR. 24 has more headroom for grading. Not used with remux",
     )
     parser.add_argument(
         "--deinterlace",
@@ -828,8 +888,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=list(HWACCELS),
         default="cuda",
         help=(
-            "Hardware decode before CPU DNxHR encode (default: cuda on NVIDIA). "
-            "Use auto to let FFmpeg pick, or off for software decode"
+            "Hardware video decode before CPU DNxHR encode (default: cuda on NVIDIA). "
+            "Use auto to let FFmpeg pick, or off for software decode. "
+            "Has no effect with --profile remux: the video is copied, and -hwaccel does not decode audio"
         ),
     )
     parser.add_argument(
@@ -842,6 +903,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Encode up to N clips at once (1-{0}). Suggested for this PC: {1}"
         ).format(MAX_JOBS, suggested_jobs()),
     )
+    parser.set_defaults(container_set=False, audio_bit_depth_set=False)
     return parser
 
 
@@ -856,9 +918,15 @@ def _print_header(
     print(f"skipped non-MTS: {skipped}")
     print(f"profile: {opts.profile}")
     print(f"container: {opts.container}")
-    print(f"audio: {AUDIO_CODECS[opts.audio_bit_depth]}")
+    if opts.profile == REMUX_PROFILE:
+        print("audio: aac")
+    else:
+        print(f"audio: {AUDIO_CODECS[opts.audio_bit_depth]}")
     print(f"output: {out_dir}")
-    print(f"hwaccel: {opts.hwaccel}")
+    if opts.profile == REMUX_PROFILE:
+        print("hwaccel: unused")
+    else:
+        print(f"hwaccel: {opts.hwaccel}")
     print(f"jobs: {jobs}")
     suggested = suggested_jobs()
     if jobs > suggested:
@@ -879,12 +947,12 @@ def _dry_run(
     ffmpeg: Optional[str],
     ffprobe: Optional[str],
 ) -> int:
-    if ffprobe is None and opts.deinterlace:
+    if opts.profile != REMUX_PROFILE and ffprobe is None and opts.deinterlace:
         print(
             "note: ffprobe not found; including yadif because --deinterlace is set. "
             "deint=interlaced is a no-op on progressive frames."
         )
-    elif ffprobe is None:
+    elif opts.profile != REMUX_PROFILE and ffprobe is None:
         print("note: ffprobe not found; field order is unknown, so -field_order is omitted.")
     ffmpeg_bin = _command_tool(ffmpeg)
     for src, dst in pairs:
@@ -975,9 +1043,40 @@ def _encode_all(
     return 1 if failed else 0
 
 
+def _apply_profile_args(args: argparse.Namespace) -> Optional[str]:
+    """Return an error message, or default remux's container to mp4.
+
+    ``--container`` and ``--audio-bit-depth`` keep their DNxHR defaults unless
+    the user passed the flag. Remux then uses mp4 when the container was omitted.
+    """
+    if args.profile == REMUX_PROFILE:
+        if args.container_set and args.container != "mp4":
+            return "error: --profile remux only supports --container mp4"
+        if args.deinterlace:
+            return (
+                "error: --deinterlace cannot be used with --profile remux "
+                "(video is copied and cannot be filtered)"
+            )
+        if args.audio_bit_depth_set:
+            return (
+                "error: --audio-bit-depth does not apply to --profile remux "
+                "(audio is AAC, not PCM)"
+            )
+        if not args.container_set:
+            args.container = "mp4"
+        return None
+    if args.container == "mp4":
+        return "error: --container mp4 is only valid with --profile remux"
+    return None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    usage = _apply_profile_args(args)
+    if usage:
+        print(usage, file=sys.stderr)
+        return 2
     if args.duration is not None and (
         not math.isfinite(args.duration) or args.duration <= 0
     ):
@@ -1003,7 +1102,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_dir = (
         Path(args.output).resolve()
         if args.output
-        else default_output_dir(input_path)
+        else default_output_dir(input_path, args.profile)
     )
     try:
         pairs = [
