@@ -49,47 +49,49 @@ GUI_JOBS = 2
 
 
 class _Palette:
-    """Night theme: charcoal surfaces, muted gray-teal accent. Every UI color lives here so contrast can be checked in one place."""
+    """Dark theme from stock Tailwind gray/blue/green/red (ForecastEngineUI-style). Every UI color lives here so contrast can be checked in one place."""
 
-    SURFACE = "#14171a"
-    FIELD = "#0d0f11"
-    STRIPE = "#171b1e"
-    CONTROL_BG = "#20272b"
-    CONTROL_HOVER = "#2c363b"
-    TEXT = "#e6eaec"
-    TEXT_SECONDARY = "#a3adb3"
-    TEXT_DISABLED = "#7b858b"
-    BORDER = "#3a444a"
-    HEADING_BG = "#20272b"
-    HEADING_FG = "#e6eaec"
-    HEADING_ACTIVE = "#2c363b"
-    # Desaturated teal, tuned for dark surfaces.
-    ACCENT = "#3f6b66"
-    ACCENT_ACTIVE = "#4b7d77"
+    # gray-950 / gray-900 / gray-800 / gray-700 / gray-50 / gray-400 / gray-500
+    SURFACE = "#030712"
+    FIELD = "#111827"
+    STRIPE = "#1f2937"
+    CONTROL_BG = "#1f2937"
+    CONTROL_HOVER = "#374151"
+    TEXT = "#f9fafb"
+    TEXT_SECONDARY = "#9ca3af"
+    TEXT_DISABLED = "#6b7280"
+    BORDER = "#374151"
+    HEADING_BG = "#111827"
+    HEADING_FG = "#f9fafb"
+    HEADING_ACTIVE = "#1f2937"
+    # blue-600 primary; blue-700 hover so white label stays ≥4.5:1 (blue-500 fails that).
+    # blue-700 is too dark for marks/rings on gray-800, so those use ACCENT or ACTIVE_FG.
+    ACCENT = "#2563eb"
+    ACCENT_ACTIVE = "#1d4ed8"
     ACCENT_FG = "#ffffff"
-    # Keep Convert recognizably teal-gray while disabled (idle window still shows the scheme).
-    ACCENT_DISABLED = "#2c3a38"
-    ACCENT_DISABLED_FG = "#8fa8a4"
-    SELECT_BG = "#24413e"
+    # blue-900 / blue-300 — still reads as the blue scheme when Convert is disabled.
+    ACCENT_DISABLED = "#1e3a8a"
+    ACCENT_DISABLED_FG = "#93c5fd"
+    SELECT_BG = "#172554"  # blue-950 (status chips stay ≥4.5:1 on selection)
     SELECT_FG = "#ffffff"
-    OK_FG = "#6fcf97"
-    FAILED_FG = "#ff8a80"
-    ACTIVE_FG = "#7fd0c6"
-    MUTED_FG = "#aab4ba"
-    ERROR_BG = "#3a1a1a"
-    ERROR_FG = "#ffb4ab"
-    ERROR_BORDER = "#7a3333"
-    DROP_BG = "#101316"
-    DROP_HOT_BG = "#16302d"
-    DROP_PAUSED_BG = "#1a1e21"
-    DROP_BORDER = "#44505a"
-    DROP_HOT_BORDER = "#5f9a92"
-    DISABLED_BG = "#20272b"
-    TROUGH = "#232b2f"
+    OK_FG = "#4ade80"  # green-400
+    FAILED_FG = "#f87171"  # red-400
+    ACTIVE_FG = "#60a5fa"  # blue-400
+    MUTED_FG = "#9ca3af"  # gray-400
+    ERROR_BG = "#450a0a"  # red-950
+    ERROR_FG = "#fca5a5"  # red-300
+    ERROR_BORDER = "#b91c1c"  # red-700
+    DROP_BG = "#111827"
+    DROP_HOT_BG = "#172554"  # blue-950
+    DROP_PAUSED_BG = "#1f2937"
+    DROP_BORDER = "#374151"
+    DROP_HOT_BORDER = "#3b82f6"  # blue-500
+    DISABLED_BG = "#1f2937"
+    TROUGH = "#1f2937"
 
 
 class _DropdownSelect(tk.Frame):
-    """Flat readonly dropdown styled for the night palette.
+    """Flat readonly dropdown styled for the dark palette.
 
     ``choices`` are the stored values (ints for jobs, strings for mode). Optional
     ``labels`` are what the closed control and popup show; defaults to ``str(value)``.
@@ -111,7 +113,7 @@ class _DropdownSelect(tk.Frame):
             bg=_Palette.CONTROL_BG,
             highlightthickness=1,
             highlightbackground=_Palette.BORDER,
-            highlightcolor=_Palette.ACCENT_ACTIVE,
+            highlightcolor=_Palette.ACCENT,
             bd=0,
             takefocus=True,
         )
@@ -825,7 +827,7 @@ def _make_checkbox_image(
     _photo_fill(img, 0, 0, width, size, _Palette.SURFACE)
     fill = _Palette.SURFACE if disabled else _Palette.CONTROL_BG
     border = _Palette.TEXT_DISABLED if disabled else _Palette.BORDER
-    mark = _Palette.TEXT_DISABLED if disabled else _Palette.ACCENT_ACTIVE
+    mark = _Palette.TEXT_DISABLED if disabled else _Palette.ACTIVE_FG
     _photo_fill(img, 0, 0, size, size, fill)
     border_w = max(2, size // 9)
     for i in range(border_w):
